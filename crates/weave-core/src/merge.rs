@@ -302,11 +302,24 @@ pub fn entity_merge_with_registry(
 ) -> MergeResult {
     crate::parsed::scope(|| {
         let composed = compose(base, ours, theirs, file_path, registry, marker_format, host);
-        let result = if composed.is_clean() {
+        let mut result = if composed.is_clean() {
             composed
         } else {
             settle(composed, base, ours, theirs, file_path, registry, host)
         };
+        if !result.is_clean()
+            && [base, ours, theirs]
+                .iter()
+                .all(|s| s.len() <= STRUCTURE_LIMIT_BYTES && !has_conflict_markers(s))
+        {
+            if let Some(content) = crate::conflict::keep_embedded_separator(
+                &result.content,
+                [base, ours, theirs],
+                marker_format,
+            ) {
+                result.content = content;
+            }
+        }
         keys_hold(
             result,
             base,

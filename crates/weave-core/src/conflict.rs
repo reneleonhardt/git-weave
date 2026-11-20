@@ -1086,6 +1086,7 @@ const MAX_INTERSTITIAL_LINES: usize = 6;
 
 /// One conflict box, as it appears in a rendered file.
 struct RenderedBox {
+    start_line: usize,
     open: String,
     /// The `refused_by:` line. Marker furniture, not either side's claim —
     /// dropped when two boxes merge, which is safe precisely because no
@@ -1231,6 +1232,180 @@ fn merge_boxes(mut prev: RenderedBox, gap: Vec<String>, next: RenderedBox) -> Re
     prev
 }
 
+fn separator_stem(line: &str) -> &str {
+    line.trim_end()
+        .trim_end_matches([',', ';', '\\'])
+        .trim_end()
+}
+
+/// Locate predecessor lines by position so repeated member names stay distinct.
+fn source_predecessors(
+    pieces: &[Piece],
+    boxes: &[(&RenderedBox, &[String])],
+    side: BoxSide,
+    source: &str,
+) -> Vec<Option<String>> {
+    let mut projected = Vec::new();
+    let mut positions = Vec::with_capacity(boxes.len());
+    for p in pieces {
+        let lines = match p {
+            Piece::Frame(lines) => lines,
+            Piece::Box(b) => {
+                if let Some((next, prefix)) = boxes.get(positions.len()) {
+                    if next.start_line == b.start_line {
+                        positions.push(projected.len() - prefix.len());
+                    }
+                }
+                match side {
+                    BoxSide::Ours => &b.ours,
+                    BoxSide::Theirs => &b.theirs,
+                    // Enhanced markers omit the ancestor. The retained arm
+                    // supplies alignment context on either side of the gap.
+                    BoxSide::Base => b.base.as_ref().unwrap_or(if b.ours.is_empty() {
+                        &b.theirs
+                    } else {
+                        &b.ours
+                    }),
+                }
+            }
+        };
+        projected.extend(lines.iter().map(String::as_str));
+    }
+    let normalized = source
+        .contains("\r\n")
+        .then(|| source.replace("\r\n", "\n"));
+    let edits = crate::subsumption::edits(
+        &(projected.join("\n") + "\n"),
+        normalized.as_deref().unwrap_or(source),
+    );
+    let mut edits = edits.iter().filter(|e| !e.old.is_empty()).peekable();
+    positions
+        .into_iter()
+        .zip(boxes)
+        .map(|(i, (_, prefix))| {
+            let line = i + 1; // diffy numbers removed lines from one
+            while edits.next_if(|e| e.old.end <= line).is_some() {}
+            match edits.peek().filter(|e| e.old.contains(&line)) {
+                None => Some(prefix[0].clone()),
+                Some(e) if line == e.old.start || line + 1 == e.old.end => {
+                    // An edit to a neighbouring line can share this hunk. Only
+                    // match a predecessor that occurs once on each side of it.
+                    let key = separator_stem(&prefix[0]);
+                    let removed = &projected[e.old.start - 1..e.old.end - 1];
+                    let candidate = if line + 1 == e.old.end {
+                        e.ins.last()?
+                    } else {
+                        e.ins.first()?
+                    };
+                    (separator_stem(candidate) == key
+                        && e.ins.iter().filter(|l| separator_stem(l) == key).count() == 1
+                        && removed.iter().filter(|l| separator_stem(l) == key).count() == 1)
+                        .then(|| candidate.clone())
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>()
+}
+
+/// A line merge can apply the removal of a terminator above an edit/delete
+/// conflict even inside an opaque string or template. Recover the exact
+/// predecessor from each source before offering the two choices.
+pub(crate) fn keep_embedded_separator(
+    content: &str,
+    sources: [&str; 3],
+    fmt: &MarkerFormat,
+) -> Option<String> {
+    let pieces = read_pieces(content, fmt);
+    let mut boxes = Vec::new();
+    for pair in pieces.windows(2) {
+        let [Piece::Frame(frame), Piece::Box(b)] = pair else {
+            continue;
+        };
+        if b.ours.is_empty() == b.theirs.is_empty() {
+            continue;
+        }
+        let Some(pos) = frame.iter().rposition(|l| {
+            let s = l.trim();
+            !s.is_empty()
+                && !crate::binding::is_trivia_line(s)
+                && !s.starts_with("--")
+                && !s.starts_with('%')
+                && !(s.starts_with("{#") && s.ends_with("#}"))
+        }) else {
+            continue;
+        };
+        boxes.push((b, &frame[pos..]));
+    }
+    if boxes.is_empty() {
+        return None;
+    }
+
+    // Most conflicts have no matching terminator in the ancestor.
+    let terminated: std::collections::HashSet<_> = sources[0]
+        .lines()
+        .filter(|line| line.trim_end().ends_with([',', ';', '\\']))
+        .map(separator_stem)
+        .collect();
+    boxes.retain(|(_, prefix)| terminated.contains(separator_stem(&prefix[0])));
+    if boxes.is_empty() {
+        return None;
+    }
+    let base = source_predecessors(&pieces, &boxes, BoxSide::Base, sources[0]);
+    let ours = source_predecessors(&pieces, &boxes, BoxSide::Ours, sources[1]);
+    let theirs = source_predecessors(&pieces, &boxes, BoxSide::Theirs, sources[2]);
+    let lines: Vec<_> = content.split_inclusive('\n').collect();
+    let mut out = String::new();
+    let mut cursor = 0;
+    for (i, (b, prefix)) in boxes.into_iter().enumerate() {
+        let (Some(ancestor), Some(ours), Some(theirs)) = (&base[i], &ours[i], &theirs[i]) else {
+            continue;
+        };
+        let (deleted, kept) = if b.ours.is_empty() {
+            (ours, theirs)
+        } else {
+            (theirs, ours)
+        };
+        if deleted.trim_end() != prefix[0].trim_end()
+            || ancestor.trim_end() != kept.trim_end()
+            || !kept
+                .trim_end()
+                .strip_prefix(deleted.trim_end())
+                .is_some_and(|s| matches!(s.trim_start(), "," | ";" | "\\" | "\\\\"))
+        {
+            continue;
+        }
+        let start = b.start_line - prefix.len();
+        out.extend(lines[cursor..start].iter().copied());
+        cursor = b.start_line;
+        // Copy the marker lines verbatim, including labels and line endings.
+        let newline = if lines[start].ends_with("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        let mut prepend = |source: &str, header_lines: usize| {
+            out.extend(lines[cursor..cursor + header_lines].iter().copied());
+            cursor += header_lines;
+            out.push_str(source.trim_end_matches(['\r', '\n']));
+            out.push_str(newline);
+            out.extend(lines[start + 1..b.start_line].iter().copied());
+        };
+        prepend(ours, 1 + usize::from(b.refusal.is_some()));
+        if let Some(base_arm) = &b.base {
+            prepend(ancestor, b.ours.len() + 1);
+            prepend(theirs, base_arm.len() + 1);
+        } else {
+            prepend(theirs, b.ours.len() + 1);
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    out.extend(lines[cursor..].iter().copied());
+    Some(out)
+}
+
 /// Read a rendered file as the alternation of frame and boxes that it is.
 ///
 /// A marker line that does not open a well-formed box — a source line quoting
@@ -1256,6 +1431,7 @@ fn read_pieces(content: &str, fmt: &MarkerFormat) -> Vec<Piece> {
             i += 1;
             continue;
         }
+        let start_line = i;
         let open = lines[i].to_string();
         let scope = open
             .split_once(" \u{2014} ")
@@ -1293,6 +1469,7 @@ fn read_pieces(content: &str, fmt: &MarkerFormat) -> Vec<Piece> {
         i += 1;
         pieces.push(Piece::Frame(std::mem::take(&mut frame)));
         pieces.push(Piece::Box(RenderedBox {
+            start_line,
             open,
             refusal,
             ours,
@@ -1630,6 +1807,22 @@ impl fmt::Display for MergeStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_separator_requires_an_unambiguous_hunk_edge() {
+        let marked = "new label\n A\n\n<<< ours\n||| base\n old\n===\n edited\n>>> theirs\nend\n";
+        let ours = "new label\n A\n\nend\n";
+        for before_gap in [" A;\n guard", " A,\n A;"] {
+            let base = format!("label\n{before_gap}\n\n old\nend\n");
+            let theirs = base.replace(" old", " edited");
+            assert!(keep_embedded_separator(
+                marked,
+                [&base, ours, &theirs],
+                &MarkerFormat::standard(3)
+            )
+            .is_none());
+        }
+    }
 
     /// The one-ruler rule, as an identity: for every side the box RENDERS,
     ///
