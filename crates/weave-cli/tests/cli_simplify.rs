@@ -61,6 +61,7 @@ fn mid_merge(name: &str) -> PathBuf {
     root
 }
 
+#[cfg(unix)]
 fn golden_bin() -> PathBuf {
     std::env::var_os("WEAVE_GOLDEN_BIN")
         .map(PathBuf::from)
@@ -137,12 +138,14 @@ fn regex_lite_us(text: &str) -> String {
 }
 
 /// (golden name, old invocation, new spellings that must print the same)
+#[cfg(unix)]
 type Case = (
     &'static str,
     &'static [&'static str],
     &'static [&'static [&'static str]],
 );
 
+#[cfg(unix)]
 const CASES: &[Case] = &[
     ("explain_json", &["explain", "app.py", "--json"], &[]),
     ("explain_text", &["explain", "app.py"], &[]),
