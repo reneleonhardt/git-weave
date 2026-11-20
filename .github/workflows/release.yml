@@ -25,15 +25,15 @@ jobs:
       should_release: ${{ steps.detect.outputs.should_release }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - name: Detect version
         id: detect
         run: |
           VERSION=$(grep '^version' crates/weave-core/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+          ref="refs/tags/v$VERSION"
+          tags=$(git ls-remote --refs origin "$ref")
+          if cut -f2 <<< "$tags" | grep -Fxq "$ref"; then
             echo "Tag v$VERSION already exists, skipping release"
             echo "should_release=false" >> "$GITHUB_OUTPUT"
           else
