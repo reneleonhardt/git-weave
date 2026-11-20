@@ -1526,6 +1526,30 @@ impl Successors<'_> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn json_dialects_reach_the_worktree_data_check() {
+        for (path, valid, duplicate) in [
+            (
+                "config.jsonc",
+                "{/* cfg */\"key\":1,}",
+                "{\"key\":1,\"key\":2,}",
+            ),
+            ("config.json5", "{key:'a'}", "{key:'a','key':'b'}"),
+            (
+                "log.jsonl",
+                "{\"key\":1}\n{\"key\":2}",
+                "{\"key\":1,\"key\":2}",
+            ),
+        ] {
+            assert!(is_supported(path));
+            let findings = verify_file(path, None, Some(valid), None, duplicate);
+            assert!(
+                findings.iter().any(|f| f.class == "DUP"),
+                "{path}: {findings:?}"
+            );
+        }
+    }
+
     fn tree(pairs: &[(&str, &str)]) -> Tree {
         pairs
             .iter()

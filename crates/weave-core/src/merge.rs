@@ -624,10 +624,14 @@ fn compose(
     let composed =
         match crate::v2::merge_file(base, ours, theirs, file_path, registry, marker_format, host) {
             Ok(result) => result,
-            Err(crate::v2::Unsupported::NoEntities) => {
+            Err(crate::v2::Unsupported::NoEntities)
+                if crate::v2::entity_separator(file_path).is_none() =>
+            {
                 no_entities_merge(base, ours, theirs, file_path, host)
             }
-            Err(_unsupported) => line_level_fallback(base, ours, theirs, file_path, host),
+            Err(_unsupported) => {
+                line_level_fallback_fmt([base, ours, theirs], file_path, marker_format, host, false)
+            }
         };
     fail_closed(
         composed,
@@ -2436,6 +2440,22 @@ pub(crate) fn line_level_fallback(
     let mut stats = MergeStats::default();
     stats.mark_fallback();
     line_merge_file(base, ours, theirs, stats, host)
+}
+
+pub(crate) fn line_level_fallback_fmt(
+    sources: [&str; 3],
+    file_path: &str,
+    fmt: &MarkerFormat,
+    host: &Host,
+    coupled: bool,
+) -> MergeResult {
+    let [base, ours, theirs] = sources;
+    let mut result = line_level_fallback(base, ours, theirs, file_path, host);
+    if !result.is_clean() && crate::v2::entity_separator(file_path).is_some() {
+        result.content =
+            crate::conflict::format_member_hunks(&result.content, fmt, sources, file_path, coupled);
+    }
+    result
 }
 
 /// The line-level merge, taken through whatever route the caller granted.
