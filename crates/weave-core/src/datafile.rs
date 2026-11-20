@@ -94,17 +94,17 @@ impl Json<'_> {
     /// Whitespace and comments.
     fn skip(&mut self) {
         loop {
-            while self.peek().is_some_and(|b| b.is_ascii_whitespace()) {
+            while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
                 self.i += 1;
             }
             if self.s[self.i..].starts_with(b"//") {
-                while self.peek().is_some_and(|b| b != b'\n') {
+                while self.peek().is_some_and(|b| !matches!(b, b'\n' | b'\r')) {
                     self.i += 1;
                 }
             } else if self.s[self.i..].starts_with(b"/*") {
                 match self.s[self.i + 2..].windows(2).position(|w| w == b"*/") {
                     Some(end) => self.i += 2 + end + 2,
-                    None => self.i = self.s.len(),
+                    None => return, // leave the unterminated comment for the caller to reject
                 }
             } else {
                 return;
@@ -135,36 +135,23 @@ impl Json<'_> {
                 {
                     self.i += 1;
                 }
-                let word = &self.s[start..self.i];
-                let number = word[0] == b'-' || word[0].is_ascii_digit();
-                if number || matches!(word, b"true" | b"false" | b"null") {
-                    Ok(())
-                } else {
-                    self.i = start;
-                    Err(self.error("expected a value"))
-                }
+                serde_json::from_slice::<serde::de::IgnoredAny>(&self.s[start..self.i])
+                    .map(|_| ())
+                    .map_err(|e| format!("invalid value at byte {start}: {e}"))
             }
             _ => Err(self.error("expected a value")),
         }
     }
 
-    /// A string's raw bytes between the quotes, escapes left as written: two
-    /// spellings of one key are rare enough that exact text is the identity.
     fn string(&mut self) -> Result<String, String> {
-        self.i += 1; // opening quote
-        let start = self.i;
-        loop {
-            match self.peek() {
-                Some(b'"') => {
-                    let raw = String::from_utf8_lossy(&self.s[start..self.i]).to_string();
-                    self.i += 1;
-                    return Ok(raw);
-                }
-                Some(b'\\') => self.i += 2,
-                Some(b'\n') | None => return Err(self.error("unterminated string")),
-                Some(_) => self.i += 1,
-            }
-        }
+        let mut stream =
+            serde_json::Deserializer::from_slice(&self.s[self.i..]).into_iter::<String>();
+        let value = stream
+            .next()
+            .expect("positioned at opening quote")
+            .map_err(|e| e.to_string())?;
+        self.i += stream.byte_offset();
+        Ok(value)
     }
 
     fn object(&mut self, path: &str, depth: usize) -> Result<(), String> {
@@ -187,7 +174,13 @@ impl Json<'_> {
             }
             self.i += 1;
             self.skip();
-            self.value(&format!("{path}.{key}"), depth + 1)?;
+            // A literal "a.b" or "rows[]" belongs to a different object than a nested path.
+            let inner = if key.contains(['.', '[', ']', '\u{1f}']) {
+                format!("{path}[{}]", serde_json::Value::String(key.clone()))
+            } else {
+                format!("{path}.{key}")
+            };
+            self.value(&inner, depth + 1)?;
             *here.entry(key).or_insert(0) += 1;
             self.skip();
             match self.peek() {
@@ -270,6 +263,11 @@ mod tests {
             ("p.json", "{\"a\": 1 \"b\": 2}"),
             ("p.json", "{\"a\": }"),
             ("p.json", "{\"a\": 1"),
+            ("p.json", "[01]"),
+            ("p.json", "[1e+]"),
+            ("p.json", "-no"),
+            ("p.json", "{} /* unfinished"),
+            ("p.json", "[1,\u{b}2]"),
             (
                 "Cargo.toml",
                 "[dependencies]\nserde = \"1\"\nserde = \"2\"\n",
@@ -289,6 +287,7 @@ mod tests {
         for (path, text) in [
             ("p.json", "{\"a\": [1, -2.5e3, true, null, \"x\\\"y\"]}"),
             ("p.json", ""),
+            ("p.json", "[1e99999, // comment\r 2,]"),
             (
                 "Cargo.toml",
                 "[dependencies]\nserde = { version = \"1\" }\n",

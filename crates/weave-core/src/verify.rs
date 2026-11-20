@@ -1569,6 +1569,20 @@ mod tests {
     }
 
     #[test]
+    fn json_duplicates_compare_decoded_keys_in_the_same_container() {
+        for (side, merged) in [
+            (r#"{"a.b":{"x":1,"x":2}}"#, r#"{"a":{"b":{"x":1,"x":2}}}"#),
+            (r#"{"rows[]":{"x":1,"x":2}}"#, r#"{"rows":[{"x":1,"x":2}]}"#),
+            ("{}", r#"{"k":1,"\u006b":2}"#),
+        ] {
+            assert!(
+                structured_data(Some(side), None, merged, "a.json").is_some(),
+                "{merged}"
+            );
+        }
+    }
+
+    #[test]
     fn a_data_key_stated_twice_at_one_path_is_refused() {
         let base = "{\n  \"a\": {\n    \"x\": 1,\n    \"y\": 2\n  }\n}\n";
         let ours = "{\n  \"a\": {\n    \"t\": 5,\n    \"x\": 1,\n    \"y\": 2\n  }\n}\n";
