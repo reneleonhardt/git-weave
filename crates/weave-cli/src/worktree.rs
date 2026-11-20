@@ -1758,7 +1758,10 @@ mod tests {
         // an interface method with its implementation, untouched by either
         // side, are the authors' code and never a finding.
         let base = "interface Hud {\n    fun computeValue(): Int\n}\n\nclass Impl : Hud {\n    override fun computeValue(): Int = 1\n}\n\n@Composable\nfun IconButton(\n    icon: String,\n    size: Int,\n    enabled: Boolean,\n    onClick: () -> Unit,\n) {\n    println(icon)\n}\n\n@Composable\nfun IconButton(\n    icon: String,\n    onClick: () -> Unit,\n) {\n    println(icon)\n}\n";
-        let ours = base.replace("println(icon)\n}\n\n@Composable", "println(\"ours\")\n}\n\n@Composable");
+        let ours = base.replace(
+            "println(icon)\n}\n\n@Composable",
+            "println(\"ours\")\n}\n\n@Composable",
+        );
         let theirs = format!("{base}\nfun added() = 2\n");
         let work = format!("{ours}\nfun added() = 2\n");
         let v = check(
@@ -1768,7 +1771,11 @@ mod tests {
             &tree(&[("Hud.kt", &work)]),
             &["Hud.kt".to_string()],
         );
-        assert!(!v[0].findings.iter().any(|f| f.class == "DUP"), "{:#?}", v[0]);
+        assert!(
+            !v[0].findings.iter().any(|f| f.class == "DUP"),
+            "{:#?}",
+            v[0]
+        );
 
         // A definition the resolution itself doubled is still caught.
         let doubled = format!("{work}\nfun added() = 2\n");
@@ -1779,7 +1786,11 @@ mod tests {
             &tree(&[("Hud.kt", &doubled)]),
             &["Hud.kt".to_string()],
         );
-        assert!(v[0].findings.iter().any(|f| f.class == "DUP"), "{:#?}", v[0]);
+        assert!(
+            v[0].findings.iter().any(|f| f.class == "DUP"),
+            "{:#?}",
+            v[0]
+        );
     }
 
     #[test]
@@ -1795,7 +1806,11 @@ mod tests {
             &tree(&[("lock.yaml", &ours)]),
             &["lock.yaml".to_string()],
         );
-        assert!(!v[0].findings.iter().any(|f| f.class == "DUP"), "{:#?}", v[0]);
+        assert!(
+            !v[0].findings.iter().any(|f| f.class == "DUP"),
+            "{:#?}",
+            v[0]
+        );
     }
 
     #[test]
