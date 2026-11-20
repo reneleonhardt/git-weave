@@ -259,15 +259,17 @@ fn indentation_member_spans(
     if body_start >= body_end {
         return None;
     }
+    let depths = crate::statement::depths(lines)?;
     let member_indent = lines[body_start..body_end]
         .iter()
-        .find(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())?;
+        .zip(&depths[body_start..body_end])
+        .find(|(line, depth)| depth.is_some() && !line.trim().is_empty())
+        .map(|(line, _)| line.len() - line.trim_start().len())?;
 
     let mut spans: Vec<MemberSpan> = Vec::new();
     for (i, line) in lines.iter().enumerate().take(body_end).skip(body_start) {
         let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || depths[i].is_none() {
             continue;
         }
         let indent = line.len() - line.trim_start().len();

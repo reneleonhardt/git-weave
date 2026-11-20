@@ -227,26 +227,19 @@ fn bigram_jaccard(a: &str, b: &str) -> f64 {
 /// b);
 /// ```
 ///
-/// So indentation proposes and depth vetoes: a line begins a statement only if
-/// every bracket opened before it has been closed. When the scan ends
-/// unbalanced the text is not something this reader understands — a language
-/// with delimiters we do not model, an unclosed literal — and the honest answer
-/// is `None`, which costs a conflict and never a wrong partition.
-///
-/// Quotes are resolved WITHIN a line: an opener with no closer on the same line
-/// is not a string. That one rule is what lets the same scanner read Rust
-/// lifetimes (`&'a str` — an apostrophe that opens nothing) and Python string
-/// literals (`'x'` — one that does), without being told which language it is
-/// looking at. Multi-line literals are exactly the two constructs that really do
-/// span lines: block comments and triple quotes.
-fn depths(lines: &[&str]) -> Option<Vec<i32>> {
+/// A statement can start when bracket depth returns to the body's starting
+/// depth. Ordinary quotes close on the same line, so a Rust lifetime such as
+/// `&'a str` leaves the depth unchanged. Block comments and triple-quoted
+/// strings can span lines. Lines that begin inside either have no statement
+/// depth. An unclosed multiline construct makes the scan inconclusive.
+pub(crate) fn depths(lines: &[&str]) -> Option<Vec<Option<i32>>> {
     let mut out = Vec::with_capacity(lines.len());
     let mut depth: i32 = 0;
     let mut in_block_comment = false;
     let mut in_triple: Option<&'static str> = None;
 
     for line in lines {
-        out.push(depth);
+        out.push((!in_block_comment && in_triple.is_none()).then_some(depth));
         let chars: Vec<char> = line.chars().collect();
         let offsets: Vec<usize> = line.char_indices().map(|(b, _)| b).collect();
         let rest_from = |i: usize| -> &str { &line[offsets[i]..] };
@@ -254,7 +247,9 @@ fn depths(lines: &[&str]) -> Option<Vec<i32>> {
         while i < chars.len() {
             let c = chars[i];
             if let Some(q) = in_triple {
-                if rest_from(i).starts_with(q) {
+                if c == '\\' {
+                    i += 2;
+                } else if rest_from(i).starts_with(q) {
                     in_triple = None;
                     i += 3;
                 } else {
@@ -263,6 +258,11 @@ fn depths(lines: &[&str]) -> Option<Vec<i32>> {
                 continue;
             }
             if in_block_comment {
+                // Rust and PostgreSQL nest these, Java and SQLite do not.
+                // This language-independent fold cannot choose a closing delimiter.
+                if rest_from(i).starts_with("/*") {
+                    return None;
+                }
                 if c == '*' && chars.get(i + 1) == Some(&'/') {
                     in_block_comment = false;
                     i += 2;
@@ -405,7 +405,8 @@ fn statement_spans(
     if body_start >= body_end {
         return None;
     }
-    let depth = depths(&lines[body_start..body_end])?;
+    let depths = depths(lines)?;
+    let depth = &depths[body_start..body_end];
     let first = lines[body_start..body_end]
         .iter()
         .position(|l| !l.trim().is_empty())?;
@@ -416,17 +417,17 @@ fn statement_spans(
     // The fragment's OWN nesting level, not zero. A body sliced out of a larger
     // construct starts wherever it starts, and its statements are the lines that
     // return to that level.
-    let base_depth = depth[first];
+    let base_depth = depth[first]?;
 
     let mut starts: Vec<usize> = Vec::new();
     let mut prev_code = "";
     for (off, line) in lines[body_start..body_end].iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || is_trivia_line(line) {
+        if depth[off].is_none() || trimmed.is_empty() || is_trivia_line(line) {
             continue;
         }
         let prev = std::mem::replace(&mut prev_code, trimmed);
-        if depth[off] != base_depth {
+        if depth[off] != Some(base_depth) {
             continue;
         }
         let indent = line.len() - line.trim_start().len();
@@ -1663,8 +1664,16 @@ mod tests {
             depths(&["    a();", "}"]).is_some(),
             "a fragment still scans"
         );
+        for delimiter in ["\"\"\"", "'''", "/*"] {
+            let close = if delimiter == "/*" { "*/" } else { delimiter };
+            assert_eq!(
+                depths(&[delimiter, "inner {", close, "next"]),
+                Some(vec![Some(0), None, None, Some(0)])
+            );
+        }
+        assert!(depths(&["/* outer", "/* inner */", "*/"]).is_none());
         let d = depths(&["fn f() {", "    a();"]).expect("a fragment still scans");
-        assert_eq!(d, vec![0, 1], "depth is reported, not judged");
+        assert_eq!(d, vec![Some(0), Some(1)], "depth is reported, not judged");
     }
 
     /// The nesting level a fragment's statements sit at is the fragment's own,
