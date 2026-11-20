@@ -168,6 +168,115 @@ mod tests {
     use super::*;
 
     #[test]
+    fn json_conflict_separator_survives_either_resolution() {
+        use crate::frame::{resolve_conflicts, Resolution};
+
+        let check = |[base, ours, theirs]: [String; 3]| {
+            for fmt in [MarkerFormat::default(), MarkerFormat::standard(11)] {
+                let result = crate::merge::entity_merge_fmt(
+                    &base,
+                    &ours,
+                    &theirs,
+                    "x.json",
+                    &fmt,
+                    &Host::default(),
+                );
+                assert!(!result.is_clean(), "{}", result.content);
+                for (side, expected) in [(Resolution::Ours, &ours), (Resolution::Theirs, &theirs)] {
+                    assert_eq!(
+                        resolve_conflicts(&result.content, side),
+                        *expected,
+                        "{}",
+                        result.content
+                    );
+                }
+                if !fmt.enhanced {
+                    let mut keep = true;
+                    let ancestor: String = result
+                        .content
+                        .split_inclusive('\n')
+                        .filter(|line| {
+                            if line.starts_with("<<<<<<<<<<< ") || *line == "===========\n" {
+                                keep = false;
+                            } else if line.starts_with("||||||||||| base")
+                                || line.starts_with(">>>>>>>>>>> ")
+                            {
+                                keep = true;
+                            } else {
+                                return keep;
+                            }
+                            false
+                        })
+                        .collect();
+                    assert_eq!(ancestor, base, "{}", result.content);
+                }
+            }
+        };
+
+        for value in [
+            "N",
+            r#""comma, and \"quotes\" N""#,
+            "[null, true, N]",
+            "{\n    \"id\": N\n  }",
+        ] {
+            for position in 0..3 {
+                for changes in [
+                    [Some(1), Some(2), Some(3)],
+                    [Some(1), None, Some(3)],
+                    [Some(1), Some(2), None],
+                    [None, Some(2), Some(3)],
+                ] {
+                    check(changes.map(|n| {
+                        let mut members = vec![
+                            r#"  "a": {"id": 1}"#.to_owned(),
+                            r#"  "b": {"id": 2}"#.to_owned(),
+                        ];
+                        if let Some(n) = n {
+                            members.insert(
+                                position,
+                                format!("  \"key\": {}", value.replace('N', &n.to_string())),
+                            );
+                        }
+                        format!("{{\n{}\n}}\n", members.join(",\n"))
+                    }));
+                }
+            }
+        }
+
+        for (empty, member) in [("{}\n", "{\n  \"id\": N\n}\n"), ("[]\n", "[\n  N\n]\n")] {
+            let edited = member.replace('N', "3");
+            check([member.replace('N', "1"), empty.to_owned(), edited.clone()]);
+            check([empty.to_owned(), member.replace('N', "2"), edited]);
+        }
+        let nested = "{\n  \"a\": {\n    \"x\": 1,\n    \"y\": 1,\n    \"z\": 1\n  },\n  \"b\": {\"x\": 1}\n}\n";
+        check([
+            nested.to_owned(),
+            nested.replace("\"z\": 1", "\"z\": 2"),
+            nested.replace("\"y\": 1", "\"y\": 3"),
+        ]);
+
+        let siblings = "  \"a\": 0,\n  \"b\": 1,\n  \"c\": 2,\n  \"d\": 3";
+        check([
+            format!("{{\n  \"old\": 4,\n{siblings}\n}}\n"),
+            format!("{{\n{siblings}\n}}\n"),
+            format!("{{\n{siblings},\n  \"old\": 5\n}}\n"),
+        ]);
+        for values in [["[]", "{}", "[3]"], ["null", "false", "-1.2e+3"]] {
+            check(values.map(|v| format!("{{\n  \"é/k~\": {v},\n  \"right\": 1\n}}\n")));
+        }
+        for template in [
+            "{\n  \"a\": N\n  , \"b\": 2\n}\n",
+            "{\n  \"a\": N, // keep this comma\n  \"b\": 2\n}\n",
+            "{\n  \"a\": 0,\n  \"x\": N,\n  \"x\": 1\n}\n",
+            "{\n  \"a\": 0,\n  \"x\": N,\n  \"\\u0078\": 1\n}\n",
+            "[\n  {\"id\": N},\n  {\"id\": 2}\n]\n",
+            "{\"a\":{\"id\":N},\"b\":{\"id\":2}}\n",
+        ] {
+            check(["1", "2", "3"].map(|n| template.replace('N', n)));
+        }
+    }
+
+    #[test]
     fn crlf_and_bom_normalize_to_one_shape() {
         assert_eq!(normalize_encoding("a\r\nb\r\n"), "a\nb\n");
         assert_eq!(normalize_encoding("\u{feff}a\nb\n"), "a\nb\n");
@@ -361,6 +470,46 @@ pub(crate) fn merge_file(
     let ours_top = crate::merge::filter_nested_entities(ours_all.clone());
     let theirs_top = crate::merge::filter_nested_entities(theirs_all.clone());
 
+    let separator = entity_separator(file_path);
+    let line_merge = |required: Option<&EntityConflict>| {
+        let mut result = crate::merge::line_level_fallback(base, ours, theirs, file_path, host);
+        if !result.is_clean() {
+            result.content = crate::conflict::format_member_hunks(&result.content, marker_format);
+        } else if let Some(conflict) = required {
+            // Moving an edited member can turn its deletion into a clean line
+            // merge. Keep the structural conflict and both source spellings.
+            result.content = crate::merge::scoped_conflict_marker(
+                &conflict.entity_name,
+                Some(base),
+                Some(ours),
+                Some(theirs),
+                false,
+                false,
+                &crate::merge::ScopeMarkers::inside(marker_format, "", "", "member_separator"),
+            );
+            result.conflicts.push(conflict.clone());
+            result.stats.entities_conflicted = 1;
+        }
+        result.content = restore.apply(result.content);
+        Ok(result)
+    };
+    if separator.is_some() {
+        let mut kinds = HashMap::new();
+        for members in [&base_top, &ours_top, &theirs_top] {
+            // An empty container has no member regions to carry its delimiters.
+            // A type change at one JSON pointer is still one member, whereas
+            // the entity matcher includes the type in its identity.
+            if members.is_empty()
+                || members.iter().any(|m| {
+                    kinds
+                        .insert(&m.id, &m.entity_type)
+                        .is_some_and(|kind| kind != &m.entity_type)
+                })
+            {
+                return line_merge(None);
+            }
+        }
+    }
     if base_top.is_empty() && !base.trim().is_empty() {
         return Err(Unsupported::NoEntities);
     }
@@ -386,7 +535,20 @@ pub(crate) fn merge_file(
     // -- Match, Classify -------------------------------------------------
     // The sequence separator comes off here and goes back on at render: every
     // stage between the two sees the entity, not its position in the object.
-    let separator = entity_separator(file_path);
+    // A comma on the next line or before a comment is not a region suffix.
+    if let Some(sep) = separator {
+        for regions in [&base_regions, &ours_regions, &theirs_regions] {
+            let mut members = regions.iter().rev().filter_map(|region| match region {
+                FileRegion::Entity(e) => Some(e.content.trim_end()),
+                _ => None,
+            });
+            if members.next().is_some_and(|last| last.ends_with(sep))
+                || members.any(|member| !member.ends_with(sep))
+            {
+                return line_merge(None);
+            }
+        }
+    }
     let (arena, claims) = build_arena(
         raws(&base_top, &base_regions, separator),
         raws(&ours_top, &ours_regions, separator),
@@ -469,14 +631,18 @@ pub(crate) fn merge_file(
         &[&base_regions, &ours_regions, &theirs_regions],
         &emitted,
     );
-    let mut content = render::render(
+    let mut content = match render::render(
         &matching.arena,
         &matching.triples,
         &resolved,
         &placement.items,
         &interstitials,
         separator,
-    );
+        marker_format,
+    ) {
+        Ok(content) => content,
+        Err(conflict) => return line_merge(Some(conflict)),
+    };
 
     // -- The result is read off the dispositions, not off the text -------
     let mut conflicts: Vec<EntityConflict> = resolved

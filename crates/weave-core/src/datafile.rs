@@ -60,7 +60,7 @@ fn yaml_keys(text: &str) -> Result<KeyTally, String> {
 
 /// JSON as a person writes it for a tool: comments and trailing commas are
 /// allowed (tsconfig, VS Code settings), anything else malformed is not.
-fn json_keys(text: &str) -> Result<KeyTally, String> {
+pub(crate) fn json_keys(text: &str) -> Result<KeyTally, String> {
     let mut walk = Json {
         s: text.as_bytes(),
         i: 0,
@@ -175,7 +175,9 @@ impl Json<'_> {
             self.i += 1;
             self.skip();
             // A literal "a.b" or "rows[]" belongs to a different object than a nested path.
-            let inner = if key.contains(['.', '[', ']', '\u{1f}']) {
+            let inner = if !matches!(self.peek(), Some(b'{' | b'[')) {
+                String::new()
+            } else if key.contains(['.', '[', ']', '\u{1f}']) {
                 format!("{path}[{}]", serde_json::Value::String(key.clone()))
             } else {
                 format!("{path}.{key}")

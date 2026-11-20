@@ -249,7 +249,12 @@ pub(crate) fn applies(path: &str) -> bool {
 /// The documents of `text`, as values. `None` when it does not load strictly.
 fn load(text: &str, f: Format) -> Option<Vec<Value>> {
     match f {
-        Format::Json => serde_json::from_str::<Value>(text).ok().map(|v| vec![v]),
+        Format::Json => {
+            let value = serde_json::from_str(text).ok()?;
+            // A value map silently discards all but the last occurrence of a key.
+            let keys = crate::datafile::json_keys(text).ok()?;
+            keys.values().all(|&count| count == 1).then(|| vec![value])
+        }
         Format::Toml => {
             let t: toml::Value = toml::from_str(text).ok()?;
             serde_json::to_value(t).ok().map(|v| vec![v])

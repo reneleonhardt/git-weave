@@ -1126,7 +1126,8 @@ enum Piece {
 /// reader who wants the breakdown should be reading it from anyway.
 pub(crate) fn coalesce_adjacent_boxes(content: &str, fmt: &MarkerFormat) -> String {
     let pieces = read_pieces(content, fmt);
-    if pieces.iter().filter(|p| matches!(p, Piece::Box(_))).count() < 2 {
+    let mut boxes = pieces.iter().filter(|p| matches!(p, Piece::Box(_)));
+    if boxes.nth(1).is_none() {
         return content.to_string();
     }
     let trailing_newline = content.ends_with('\n');
@@ -1163,8 +1164,71 @@ pub(crate) fn coalesce_adjacent_boxes(content: &str, fmt: &MarkerFormat) -> Stri
         }
     }
 
+    write_pieces(&out, fmt, trailing_newline)
+}
+
+/// Attach a member separator to the shared suffix, or to each present alternative
+/// when the conflict box itself ends the member.
+pub(crate) fn separated_conflict(content: &str, fmt: &MarkerFormat, separator: &str) -> String {
+    fn append(lines: &mut [String], separator: &str) {
+        if let Some(line) = lines.iter_mut().rev().find(|l| !l.trim_end().is_empty()) {
+            let end = line.trim_end();
+            if !end.ends_with(separator) {
+                line.insert_str(end.len(), separator);
+            }
+        }
+    }
+
+    let mut pieces = read_pieces(content, fmt);
+    for piece in pieces.iter_mut().rev() {
+        match piece {
+            Piece::Frame(lines) if lines.iter().all(|l| l.trim().is_empty()) => continue,
+            Piece::Frame(lines) => append(lines, separator),
+            Piece::Box(b) => {
+                append(&mut b.ours, separator);
+                if let Some(base) = &mut b.base {
+                    append(base, separator);
+                }
+                append(&mut b.theirs, separator);
+            }
+        }
+        break;
+    }
+    write_pieces(&pieces, fmt, content.ends_with('\n'))
+}
+
+/// Keep the source line merge's hunk boundaries when a JSON separator spans members.
+pub(crate) fn format_member_hunks(content: &str, fmt: &MarkerFormat) -> String {
+    let scope = crate::merge::ScopeMarkers::inside(fmt, "", "", "member_separator");
+    let mut out = String::new();
+    for piece in read_pieces(content, &MarkerFormat::standard(7)) {
+        match piece {
+            Piece::Frame(lines) => {
+                for line in lines {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+            }
+            Piece::Box(b) => out.push_str(&crate::merge::scoped_conflict_marker(
+                "JSON members",
+                b.base.as_ref().map(|lines| lines.join("\n")).as_deref(),
+                Some(&b.ours.join("\n")),
+                Some(&b.theirs.join("\n")),
+                false,
+                false,
+                &scope,
+            )),
+        }
+    }
+    if !content.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn write_pieces(pieces: &[Piece], fmt: &MarkerFormat, trailing_newline: bool) -> String {
     let mut s = String::new();
-    for piece in &out {
+    for piece in pieces {
         match piece {
             Piece::Frame(lines) => {
                 for l in lines {
@@ -1254,11 +1318,12 @@ fn read_pieces(content: &str, fmt: &MarkerFormat) -> Vec<Piece> {
             .map(|(_, rest)| rest.to_string())
             .unwrap_or_else(|| open.clone());
         i += 1;
-        let refusal = (i < lines.len() && refusal_body(lines[i]).is_some()).then(|| {
-            let h = lines[i].to_string();
-            i += 1;
-            h
-        });
+        let refusal =
+            (fmt.enhanced && i < lines.len() && refusal_body(lines[i]).is_some()).then(|| {
+                let h = lines[i].to_string();
+                i += 1;
+                h
+            });
         let take = |i: &mut usize, stop: &[&str]| -> Vec<String> {
             let mut v = Vec::new();
             while *i < lines.len() && !stop.iter().any(|m| lines[*i].starts_with(m)) {

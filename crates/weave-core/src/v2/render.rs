@@ -280,14 +280,15 @@ pub(crate) fn emitted_src_ids(
     out
 }
 
-pub(crate) fn render(
+pub(crate) fn render<'a>(
     arena: &Arena,
     triples: &[Triple],
-    resolved: &[Resolved],
+    resolved: &'a [Resolved],
     items: &[PlannedItem],
     interstitials: &Interstitials<'_>,
     member_separator: Option<&str>,
-) -> String {
+    marker_format: &crate::conflict::MarkerFormat,
+) -> Result<String, &'a crate::conflict::EntityConflict> {
     let mut out = String::new();
     // Each interstitial is spent once, the same discipline claims give
     // entities: a gap emitted for one entity cannot reappear behind another.
@@ -313,6 +314,19 @@ pub(crate) fn render(
             _ => None,
         })
         .collect();
+
+    // An absent final alternative also changes the preceding member's comma.
+    // Both lines must participate in the same conflict decision.
+    if let (Some(_), [.., _, (last, _)]) = (member_separator, emitting.as_slice()) {
+        if let Disposition::Conflict { conflict, .. } = &resolved[last.triple].disposition {
+            if conflict.ours_content.is_none()
+                || conflict.theirs_content.is_none()
+                || (!marker_format.enhanced && conflict.base_content.is_none())
+            {
+                return Err(conflict);
+            }
+        }
+    }
 
     let mut first = true;
     for (position, (item, text)) in emitting.iter().enumerate() {
@@ -354,17 +368,14 @@ pub(crate) fn render(
                 out.push('\n');
             }
         }
-        // The separator goes back on here, and only here: it says this member
-        // is followed by another one, which is a fact about the rendered
-        // sequence and about nothing the merge decided. Never behind a marker
-        // block — a comma on the `>>>>>>>` line stops it being a marker, and a
-        // file with markers in it is not a valid document anyway.
-        let sep = match &resolved[item.triple].disposition {
-            Disposition::Conflict { .. } => None,
-            _ if position + 1 == emitting.len() => None,
-            _ => member_separator,
-        };
-        push_entity(&mut out, text, sep);
+        let separator = member_separator.filter(|_| position + 1 < emitting.len());
+        match separator {
+            Some(sep) if resolved[item.triple].disposition.is_conflict() => {
+                let marked = crate::conflict::separated_conflict(text, marker_format, sep);
+                push_entity(&mut out, &marked, None);
+            }
+            _ => push_entity(&mut out, text, separator),
+        }
         first = false;
     }
 
@@ -412,5 +423,5 @@ pub(crate) fn render(
         }
         out.push_str(&joined);
     }
-    out
+    Ok(out)
 }
