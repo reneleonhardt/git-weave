@@ -601,7 +601,7 @@ fn compose(
     if is_binary(base) || is_binary(ours) || is_binary(theirs) {
         let mut stats = MergeStats::default();
         stats.mark_fallback();
-        return line_merge_file(base, ours, theirs, stats, host);
+        return line_merge_file(base, ours, theirs, stats, marker_format.marker_length, host);
     }
 
     // Large file fallback
@@ -609,7 +609,7 @@ fn compose(
         .iter()
         .any(|t| t.len() > STRUCTURE_LIMIT_BYTES)
     {
-        return line_level_fallback(base, ours, theirs, file_path, host);
+        return line_level_fallback(base, ours, theirs, marker_format.marker_length, host);
     }
 
     // ------------------------------------------------------------------
@@ -625,9 +625,11 @@ fn compose(
         match crate::v2::merge_file(base, ours, theirs, file_path, registry, marker_format, host) {
             Ok(result) => result,
             Err(crate::v2::Unsupported::NoEntities) => {
-                no_entities_merge(base, ours, theirs, file_path, host)
+                no_entities_merge(base, ours, theirs, file_path, marker_format, host)
             }
-            Err(_unsupported) => line_level_fallback(base, ours, theirs, file_path, host),
+            Err(_unsupported) => {
+                line_level_fallback(base, ours, theirs, marker_format.marker_length, host)
+            }
         };
     fail_closed(
         composed,
@@ -657,9 +659,10 @@ fn no_entities_merge(
     ours: &str,
     theirs: &str,
     file_path: &str,
+    marker_format: &MarkerFormat,
     host: &Host,
 ) -> MergeResult {
-    let lines = line_level_fallback(base, ours, theirs, file_path, host);
+    let lines = line_level_fallback(base, ours, theirs, marker_format.marker_length, host);
     if lines.conflicts.is_empty() {
         return lines;
     }
@@ -845,7 +848,14 @@ fn fail_closed(
 
     let mut stats = composed.stats.clone();
     stats.mark_fallback();
-    let line = line_merge_file(base, ours, theirs, stats.clone(), host);
+    let line = line_merge_file(
+        base,
+        ours,
+        theirs,
+        stats.clone(),
+        marker_format.marker_length,
+        host,
+    );
     if line.is_clean() && verify(&line.content, &[]).is_none() {
         // Git's own answer, and it verifies: weave is never worse than git.
         return line;
@@ -2430,12 +2440,12 @@ pub(crate) fn line_level_fallback(
     base: &str,
     ours: &str,
     theirs: &str,
-    _file_path: &str,
+    width: usize,
     host: &Host,
 ) -> MergeResult {
     let mut stats = MergeStats::default();
     stats.mark_fallback();
-    line_merge_file(base, ours, theirs, stats, host)
+    line_merge_file(base, ours, theirs, stats, width, host)
 }
 
 /// The line-level merge, taken through whatever route the caller granted.
@@ -2462,13 +2472,19 @@ pub(crate) fn line_merge_file(
     ours: &str,
     theirs: &str,
     mut stats: MergeStats,
+    width: usize,
     host: &Host,
 ) -> MergeResult {
     let Some(line_merge) = host.line_merge else {
-        return diffy_fallback(base, ours, theirs, stats);
+        return diffy_fallback(base, ours, theirs, stats, width);
     };
-    let Some(merged) = line_merge(LineMergeStyle::Labelled, base, ours, theirs) else {
-        return diffy_fallback(base, ours, theirs, stats);
+    let style = if width == 7 {
+        LineMergeStyle::Labelled
+    } else {
+        LineMergeStyle::LabelledWithWidth(width)
+    };
+    let Some(merged) = line_merge(style, base, ours, theirs) else {
+        return diffy_fallback(base, ours, theirs, stats, width);
     };
 
     if merged.clean {
@@ -2501,8 +2517,17 @@ pub(crate) fn line_merge_file(
 
 /// The in-process line merge, used when no line-level route was granted or
 /// the granted one could not answer.
-fn diffy_fallback(base: &str, ours: &str, theirs: &str, mut stats: MergeStats) -> MergeResult {
-    match diffy::merge(base, ours, theirs) {
+fn diffy_fallback(
+    base: &str,
+    ours: &str,
+    theirs: &str,
+    mut stats: MergeStats,
+    width: usize,
+) -> MergeResult {
+    match diffy::MergeOptions::new()
+        .set_conflict_marker_length(width)
+        .merge(base, ours, theirs)
+    {
         Ok(merged) => MergeResult {
             content: merged,
             conflicts: vec![],
@@ -3200,21 +3225,56 @@ export function agentB() {
         let base = "a\nb\nc\nd\ne\n";
         let ours = "A\nb\nc\nd\ne\n";
         let theirs = "a\nb\nc\nd\nE\n";
-        let result = line_level_fallback(base, ours, theirs, "test.rs", &Host::default());
+        let result = line_level_fallback(base, ours, theirs, 7, &Host::default());
         assert!(result.is_clean());
         assert!(result.stats.used_fallback);
         assert_eq!(result.content, "A\nb\nc\nd\nE\n");
     }
 
     #[test]
-    fn test_line_level_fallback_conflict() {
-        // Same line changed differently → conflict
-        let base = "a\nb\nc\n";
-        let ours = "X\nb\nc\n";
-        let theirs = "Y\nb\nc\n";
-        let result = line_level_fallback(base, ours, theirs, "test.rs", &Host::default());
-        assert!(!result.is_clean());
-        assert!(result.stats.used_fallback);
+    fn fallback_markers_use_requested_width() {
+        use crate::frame::{marker_line_count, resolve_conflicts, Resolution};
+        let doc = |v| format!("most recent:\n>>>>>>>literal\nvalue {v}\n");
+        for width in [3, 7, 11] {
+            for line_merge in [
+                None,
+                Some(crate::host::git_line_merge as crate::host::LineMerge),
+            ] {
+                let host = Host {
+                    line_merge,
+                    ..Host::default()
+                };
+                let r = entity_merge_fmt(
+                    &doc(0),
+                    &doc(1),
+                    &doc(2),
+                    "data.unknown",
+                    &MarkerFormat::standard(width),
+                    &host,
+                );
+                assert!(!r.is_clean());
+                assert_eq!(marker_line_count(&r.content), 4);
+                for (c, label) in [
+                    ('<', " ours"),
+                    (
+                        '|',
+                        if line_merge.is_some() {
+                            " base"
+                        } else {
+                            " original"
+                        },
+                    ),
+                    ('=', ""),
+                    ('>', " theirs"),
+                ] {
+                    let marker = format!("{}{label}", c.to_string().repeat(width));
+                    assert!(r.content.lines().any(|l| l == marker), "{}", r.content);
+                }
+                for (side, n) in [(Resolution::Ours, 1), (Resolution::Theirs, 2)] {
+                    assert_eq!(resolve_conflicts(&r.content, side), doc(n));
+                }
+            }
+        }
     }
 
     /// A reduced real-world case: one side reorders two `use` lines, the other
@@ -3228,7 +3288,7 @@ export function agentB() {
         let base = "use crate::*;\nuse std::fs;\n";
         let ours = "use std::fs;\nuse crate::*;\n";
         let theirs = "use crate::*;\nuse std::fs;\nuse itertools::Itertools;\n";
-        let out = line_level_fallback(base, ours, theirs, "x.rs", &Host::default());
+        let out = line_level_fallback(base, ours, theirs, 7, &Host::default());
         assert!(!out.is_clean(), "adjacent edits: {:?}", out.content);
         for line in ["use std::fs;", "use crate::*;", "use itertools::Itertools;"] {
             assert!(

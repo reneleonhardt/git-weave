@@ -59,7 +59,11 @@ fn aborting_a_conflicted_merge_restores_the_pre_merge_state() {
             &format!("\"{}\" %O %A %B %L %P", driver_bin),
         ],
     );
-    fs::write(dir.join(".gitattributes"), "*.py merge=weave\n").unwrap();
+    fs::write(
+        dir.join(".gitattributes"),
+        "*.py merge=weave conflict-marker-size=11\n",
+    )
+    .unwrap();
     fs::write(dir.join("app.py"), base).unwrap();
     git_ok(dir, &["add", "."]);
     git_ok(dir, &["commit", "-q", "-m", "base"]);
@@ -74,7 +78,9 @@ fn aborting_a_conflicted_merge_restores_the_pre_merge_state() {
     assert!(!merge.status.success(), "this merge must conflict");
     let conflicted = fs::read_to_string(dir.join("app.py")).unwrap();
     assert!(
-        conflicted.contains("<<<<<<<"),
+        conflicted
+            .lines()
+            .any(|line| line.starts_with("<<<<<<<<<<< ours —")),
         "markers visible mid-conflict"
     );
 

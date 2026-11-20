@@ -119,13 +119,16 @@ pub fn teach_on_marker(content: &str, file_path: &str, marker_length: usize) -> 
     let close = ">".repeat(marker_length);
     let mut out = String::with_capacity(content.len() + 128);
     let mut done = false;
+    let mut opened = false;
     for piece in content.split_inclusive('\n') {
         let line = piece.strip_suffix('\n').unwrap_or(piece);
         let line = line.strip_suffix('\r').unwrap_or(line);
-        let is_close = line.starts_with(&close)
-            && !line[close.len()..].starts_with('>')
+        opened |= !done && crate::frame::opening_width(line) == Some(marker_length);
+        let is_close = line
+            .strip_prefix(&close)
+            .is_some_and(|label| label == " theirs" || label.starts_with(" theirs "))
             && !line.contains(TEACH_MARK);
-        if !done && is_close {
+        if opened && !done && is_close {
             out.push_str(line);
             out.push_str(&format!(
                 " \u{00b7} {TEACH_MARK}{file_path}' for per-hunk detail, \
@@ -1239,11 +1242,15 @@ fn read_pieces(content: &str, fmt: &MarkerFormat) -> Vec<Piece> {
     let sep_m = "=".repeat(fmt.marker_length);
     let close_m = ">".repeat(fmt.marker_length);
 
+    let marker = |line: &str, run: &str| {
+        line.strip_prefix(run)
+            .is_some_and(|label| label.is_empty() || label.starts_with(' '))
+    };
     let mut pieces: Vec<Piece> = Vec::new();
     let mut frame: Vec<String> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        if !lines[i].starts_with(&open_m) {
+        if !marker(lines[i], &open_m) {
             frame.push(lines[i].to_string());
             i += 1;
             continue;
@@ -1254,30 +1261,31 @@ fn read_pieces(content: &str, fmt: &MarkerFormat) -> Vec<Piece> {
             .map(|(_, rest)| rest.to_string())
             .unwrap_or_else(|| open.clone());
         i += 1;
-        let refusal = (i < lines.len() && refusal_body(lines[i]).is_some()).then(|| {
-            let h = lines[i].to_string();
-            i += 1;
-            h
-        });
+        let refusal =
+            (fmt.enhanced && i < lines.len() && refusal_body(lines[i]).is_some()).then(|| {
+                let h = lines[i].to_string();
+                i += 1;
+                h
+            });
         let take = |i: &mut usize, stop: &[&str]| -> Vec<String> {
             let mut v = Vec::new();
-            while *i < lines.len() && !stop.iter().any(|m| lines[*i].starts_with(m)) {
+            while *i < lines.len() && !stop.iter().any(|m| marker(lines[*i], m)) {
                 v.push(lines[*i].to_string());
                 *i += 1;
             }
             v
         };
         let ours = take(&mut i, &[&base_m, &sep_m, &close_m, &open_m]);
-        let base = (i < lines.len() && lines[i].starts_with(&base_m)).then(|| {
+        let base = (i < lines.len() && marker(lines[i], &base_m)).then(|| {
             i += 1;
             take(&mut i, &[&sep_m, &close_m, &open_m])
         });
-        if i >= lines.len() || !lines[i].starts_with(&sep_m) {
+        if i >= lines.len() || !marker(lines[i], &sep_m) {
             return vec![Piece::Frame(content.lines().map(str::to_string).collect())];
         }
         i += 1;
         let theirs = take(&mut i, &[&close_m, &open_m]);
-        if i >= lines.len() || !lines[i].starts_with(&close_m) {
+        if i >= lines.len() || !marker(lines[i], &close_m) {
             return vec![Piece::Frame(content.lines().map(str::to_string).collect())];
         }
         let close = lines[i].to_string();
@@ -1321,7 +1329,11 @@ pub fn parse_weave_conflicts(content: &str) -> Vec<ParsedConflict> {
 
     while i < lines.len() {
         // Look for <<<<<<< ours — <type> `<name>` (<complexity>, confidence: <conf>)
-        if lines[i].starts_with("<<<<<<< ours") {
+        if let Some(width) =
+            crate::frame::opening_width(lines[i]).filter(|&n| lines[i][n..].starts_with(" ours"))
+        {
+            let separator = "=".repeat(width);
+            let close = format!("{} theirs", ">".repeat(width));
             let header = lines[i];
             let (entity_kind, entity_name, complexity, confidence) = parse_conflict_header(header);
 
@@ -1338,7 +1350,7 @@ pub fn parse_weave_conflicts(content: &str) -> Vec<ParsedConflict> {
 
             // Read ours content until =======
             let mut ours_lines = Vec::new();
-            while i < lines.len() && lines[i] != "=======" {
+            while i < lines.len() && lines[i] != separator {
                 ours_lines.push(lines[i]);
                 i += 1;
             }
@@ -1346,7 +1358,7 @@ pub fn parse_weave_conflicts(content: &str) -> Vec<ParsedConflict> {
 
             // Read theirs content until >>>>>>>
             let mut theirs_lines = Vec::new();
-            while i < lines.len() && !lines[i].starts_with(">>>>>>> theirs") {
+            while i < lines.len() && !lines[i].starts_with(&close) {
                 theirs_lines.push(lines[i]);
                 i += 1;
             }

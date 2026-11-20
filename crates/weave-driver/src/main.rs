@@ -180,6 +180,9 @@ enum Refusal {
     #[error("{flag} requires a path argument")]
     FlagNeedsValue { flag: &'static str },
 
+    #[error("-l/--marker-length requires a positive marker width")]
+    InvalidMarkerLength,
+
     #[error("expected at least <base> <ours> <theirs>, got {got}")]
     NotEnoughArguments { got: usize },
 
@@ -207,6 +210,7 @@ impl Refusal {
     /// The `Display` text is for a person; this is for a query.
     fn kind(&self) -> &'static str {
         match self {
+            Refusal::InvalidMarkerLength => "invalid_marker_length",
             Refusal::FlagNeedsValue { .. } => "flag_needs_value",
             Refusal::NotEnoughArguments { .. } => "not_enough_arguments",
             Refusal::UnreadableInput { .. } => "unreadable_input",
@@ -287,9 +291,13 @@ fn run(started: std::time::Instant) -> Result<Verdict, Refusal> {
                 i += 1;
             }
             "-l" | "--marker-length" => {
-                if i + 1 < raw_args.len() {
-                    marker_length = raw_args[i + 1].parse::<usize>().ok();
-                }
+                marker_length = Some(
+                    raw_args
+                        .get(i + 1)
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .filter(|n| *n > 0)
+                        .ok_or(Refusal::InvalidMarkerLength)?,
+                );
                 i += 2;
             }
             "-p" | "--path" => {
@@ -349,7 +357,15 @@ fn run(started: std::time::Instant) -> Result<Verdict, Refusal> {
     // Otherwise (git merge driver), use enhanced markers with entity metadata.
     let fmt = marker_length
         .map(MarkerFormat::standard)
-        .unwrap_or_default()
+        .unwrap_or_else(|| {
+            let mut fmt = MarkerFormat::default();
+            if positional.len() >= 5 {
+                if let Some(width) = positional[3].parse().ok().filter(|n| *n > 0) {
+                    fmt.marker_length = width;
+                }
+            }
+            fmt
+        })
         .for_file(&file_path);
     // The one place this program says what a merge may touch. `git merge-file`
     // is a real second opinion the driver has always paid for, and
@@ -742,7 +758,7 @@ mod tests {
                 let close = ">".repeat(width);
                 let sep = "=".repeat(width);
                 let tail = format!("{});{newline}}}{newline}", "    // unchanged\n".repeat(200));
-                let source = format!("function View() {{{newline}{open} ours — scope `return (`{newline}ours{newline}{sep}{newline}theirs{newline}{close} theirs — scope `return (`{newline}{tail}");
+                let source = format!("{close} theirs is a quoted source line{newline}function View() {{{newline}{open} ours — scope `return (`{newline}ours{newline}{sep}{newline}theirs{newline}{close} theirs — scope `return (`{newline}{tail}");
                 let output = weave_core::conflict::teach_on_marker(&source, "view.tsx", width);
                 let marked = output
                     .lines()
@@ -752,11 +768,12 @@ mod tests {
                 assert!(marked[0].starts_with(&format!("{close} theirs — scope `return (`")));
                 assert!(output.ends_with(&tail));
                 assert_eq!(output.lines().count(), source.lines().count());
-                for side in ["ours", "theirs"] {
-                    let start = output.find(&format!("{open} ours")).unwrap();
-                    let end = output.find(&format!("{close} theirs")).unwrap();
-                    let end = end + output[end..].find('\n').unwrap() + 1;
-                    let resolved = format!("{}{side}{newline}{}", &output[..start], &output[end..]);
+                use weave_core::frame::{resolve_conflicts, Resolution};
+                for side in [Resolution::Ours, Resolution::Theirs] {
+                    let resolved = resolve_conflicts(&output, side);
+                    assert!(
+                        resolved.starts_with(&format!("{close} theirs is a quoted source line\n"))
+                    );
                     assert!(!resolved.contains("weave: run"));
                 }
             }
