@@ -3675,6 +3675,7 @@ dependencies = [
  "thiserror",
  "weave-core",
  "weave-crdt",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -213,9 +213,8 @@ fn test_migration_preserves_existing_data() {
 
 #[test]
 fn test_migration_idempotent() {
-    let path = std::env::temp_dir().join("weave_test_migration_idempotent.automerge");
-    // Clean up from previous run if needed
-    let _ = std::fs::remove_file(&path);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.automerge");
 
     // Create and populate a doc via open (saves to disk)
     {
@@ -238,9 +237,6 @@ fn test_migration_idempotent() {
     let status = get_entity_content(&state2, "eid1").unwrap();
     assert_eq!(status.content, "content_v1");
     assert_eq!(status.version_vector.get("agent-1"), 1);
-
-    // Clean up
-    let _ = std::fs::remove_file(&path);
 }
 
 // ── Version vector concurrent detection ──
@@ -276,4 +272,139 @@ fn test_entity_status_includes_vv_and_merge_state() {
     assert_eq!(status.version_vector.get("agent-1"), 1);
     assert_eq!(status.merge_state, "clean");
     assert_eq!(status.version, 1);
+}
+
+#[test]
+fn saving_a_legacy_snapshot_persists_its_migration() {
+    use automerge::{transaction::Transactable, AutoCommit, ObjType, ROOT};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.automerge");
+    let mut legacy = AutoCommit::new();
+    legacy.put(ROOT, "schema_version", 3).unwrap();
+    legacy.put_object(ROOT, "entities", ObjType::Map).unwrap();
+    let before = legacy.save();
+    std::fs::write(&path, &before).unwrap();
+
+    let mut state = EntityStateDoc::open_for_update(&path).unwrap();
+    state.save().unwrap();
+    assert_ne!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn saving_unchanged_state_preserves_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.automerge");
+    let mut state = EntityStateDoc::open_for_update(&path).unwrap();
+    state.save().unwrap();
+    let file = std::fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(std::time::UNIX_EPOCH).unwrap();
+    drop(file);
+    let before = path.metadata().unwrap().modified().unwrap();
+    state.save().unwrap();
+    assert_eq!(path.metadata().unwrap().modified().unwrap(), before);
+}
+
+#[test]
+fn stale_snapshots_cannot_overwrite_a_saved_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.automerge");
+    let mut writer = EntityStateDoc::open(&path).unwrap();
+    for id in ["first", "second"] {
+        let mut stale = EntityStateDoc::open(&path).unwrap();
+        upsert_entity(&mut writer, id, id, "function", "a.rs", "hash").unwrap();
+        writer.save().unwrap();
+        assert!(matches!(
+            stale.save(),
+            Err(weave_crdt::WeaveError::StateChanged(_))
+        ));
+        assert!(get_entity_status(&EntityStateDoc::open(&path).unwrap(), id).is_ok());
+    }
+}
+
+#[test]
+fn simultaneous_writers_see_each_others_committed_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.automerge");
+    let start = std::sync::Barrier::new(4);
+    std::thread::scope(|threads| {
+        for id in ["a", "b", "c", "d"] {
+            let (path, start) = (&path, &start);
+            threads.spawn(move || {
+                start.wait();
+                let mut state = EntityStateDoc::open_for_update(path).unwrap();
+                upsert_entity(&mut state, id, id, "function", "a.rs", "hash").unwrap();
+                state.save().unwrap();
+            });
+        }
+    });
+    let state = EntityStateDoc::open(&path).unwrap();
+    for id in ["a", "b", "c", "d"] {
+        assert!(get_entity_status(&state, id).is_ok(), "{id}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn saving_through_a_symlink_updates_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.automerge");
+    let alias = dir.path().join("alias.automerge");
+    std::os::unix::fs::symlink("state.automerge", &alias).unwrap();
+    let mut stale = EntityStateDoc::open(&path).unwrap();
+    for (id, open) in [
+        (
+            "locked",
+            EntityStateDoc::open_for_update as fn(&std::path::Path) -> _,
+        ),
+        ("snapshot", EntityStateDoc::open),
+    ] {
+        let mut state = open(&alias).unwrap();
+        upsert_entity(&mut state, id, id, "function", "a.rs", "hash").unwrap();
+        state.save().unwrap();
+        assert!(alias.is_symlink());
+        assert!(get_entity_status(&EntityStateDoc::open(&path).unwrap(), id).is_ok());
+    }
+    assert!(path.with_added_extension("lock").exists());
+    assert!(!alias.with_added_extension("lock").exists());
+    assert!(matches!(
+        stale.save(),
+        Err(weave_crdt::WeaveError::StateChanged(_))
+    ));
+}
+
+#[test]
+fn writes_respect_state_file_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.automerge");
+    let mut state = EntityStateDoc::open_for_update(&path).unwrap();
+    state.save().unwrap();
+    let mut permissions = path.metadata().unwrap().permissions();
+    let original_permissions = permissions.clone();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    upsert_entity(&mut state, "new", "new", "function", "a.rs", "hash").unwrap();
+    let write = state.save();
+    std::fs::set_permissions(&path, original_permissions).unwrap();
+    assert!(
+        matches!(write, Err(weave_crdt::WeaveError::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied)
+    );
+    assert!(get_entity_status(&EntityStateDoc::open(&path).unwrap(), "new").is_err());
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn writes_do_not_split_hard_linked_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.automerge");
+    let alias = dir.path().join("alias.automerge");
+    let mut state = EntityStateDoc::open_for_update(&path).unwrap();
+    state.save().unwrap();
+    std::fs::hard_link(&path, &alias).unwrap();
+    upsert_entity(&mut state, "new", "new", "function", "a.rs", "hash").unwrap();
+    assert!(state.save().is_err());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        std::fs::read(&alias).unwrap()
+    );
 }

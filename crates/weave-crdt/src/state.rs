@@ -1,8 +1,10 @@
+use std::fs::{self, File};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use automerge::{
-    transaction::Transactable, AutoCommit, AutomergeError, ObjId, ObjType, ReadDoc, ScalarValue,
-    Value, ROOT,
+    transaction::Transactable, AutoCommit, AutomergeError, ChangeHash, ObjId, ObjType, ReadDoc,
+    ScalarValue, Value, ROOT,
 };
 
 use crate::error::{Result, WeaveError};
@@ -63,24 +65,95 @@ const SCHEMA_VERSION: u64 = 4;
 /// every entity it creates, so there is nothing left for it to fall back to.
 pub struct EntityStateDoc {
     pub(crate) doc: AutoCommit,
-    pub(crate) path: PathBuf,
+    path: PathBuf,
+    saved_bytes: Option<Vec<u8>>,
+    saved_heads: Vec<ChangeHash>,
+    write_lock: Option<File>,
 }
 
 impl EntityStateDoc {
-    /// Load from disk or create a new document.
+    /// Read a snapshot, or start an empty document if the file is absent.
+    /// Use [`Self::open_for_update`] when a write depends on the current state.
     pub fn open(path: &Path) -> Result<Self> {
-        let doc = if path.exists() {
-            let data = std::fs::read(path)?;
-            AutoCommit::load(&data)?
+        let saved_bytes = Self::read_file(path)?;
+        let mut doc = match &saved_bytes {
+            Some(bytes) => AutoCommit::load(bytes)?,
+            None => Self::create_new_doc()?,
+        };
+        let saved_heads = if saved_bytes.is_some() {
+            doc.get_heads()
         } else {
-            Self::create_new_doc()?
+            Vec::new()
         };
         let mut state = Self {
             doc,
-            path: path.to_path_buf(),
+            path: path.to_owned(),
+            saved_bytes,
+            saved_heads,
+            write_lock: None,
         };
         state.migrate_if_needed()?;
         Ok(state)
+    }
+
+    /// Serialize a read-modify-write operation until save or drop.
+    pub fn open_for_update(path: &Path) -> Result<Self> {
+        let target = Self::state_target(path)?;
+        let lock = Self::lock_file(&target, path)?;
+        let mut state = Self::open(&target)?;
+        state.write_lock = Some(lock);
+        Ok(state)
+    }
+
+    fn state_target(path: &Path) -> io::Result<PathBuf> {
+        let mut path = path.to_owned();
+        loop {
+            match fs::canonicalize(&path) {
+                Ok(target) => return Ok(target),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            // An existing symlink may point at a state file yet to be created.
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_symlink() => {
+                    let target = fs::read_link(&path)?;
+                    path = path.with_file_name(target);
+                }
+                Ok(_) => return Ok(path),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(path),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn read_file(path: &Path) -> io::Result<Option<Vec<u8>>> {
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn lock_file(path: &Path, requested: &Path) -> io::Result<File> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Replacing the state file changes its inode. Keep the lock on a stable sibling.
+        let lock = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_added_extension("lock"))?;
+        lock.lock()?;
+        if let Some(repo_root) = requested
+            .parent()
+            .filter(|parent| parent.ends_with(".weave"))
+            .and_then(Path::parent)
+        {
+            let _ = weave_core::git::ensure_locally_excluded(repo_root, ".weave/");
+        }
+        Ok(lock)
     }
 
     /// Create a new in-memory document. A test door: no product path opens a
@@ -92,6 +165,9 @@ impl EntityStateDoc {
         let mut state = Self {
             doc,
             path: PathBuf::new(),
+            saved_bytes: None,
+            saved_heads: Vec::new(),
+            write_lock: None,
         };
         state.migrate_if_needed()?;
         Ok(state)
@@ -191,6 +267,9 @@ impl EntityStateDoc {
         Ok(Self {
             doc: AutoCommit::load(&bytes)?,
             path: PathBuf::new(),
+            saved_bytes: None,
+            saved_heads: Vec::new(),
+            write_lock: None,
         })
     }
 
@@ -202,29 +281,82 @@ impl EntityStateDoc {
         Ok(())
     }
 
-    /// Save the document to disk.
+    /// Atomically publish the document. A stale snapshot returns [`WeaveError::StateChanged`].
     pub fn save(&mut self) -> Result<()> {
         if self.path.as_os_str().is_empty() {
             return Ok(()); // In-memory mode, no-op
         }
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-            // `parent` is `.weave/` — weave's own coordination state, not
-            // repository content. It must never show up in `git status`,
-            // get swept into `git add -A`, or ride along in a generated
-            // patch (see `weave_core::git::ensure_locally_excluded`).
-            // Best-effort and idempotent, on every save rather than only the
-            // first: a repo we can't find, or a git we can't run, must never
-            // block writing the state a caller asked for, and a `.weave/`
-            // directory that predates this fix gets excluded retroactively
-            // on its very next save.
-            if let Some(repo_root) = parent.parent() {
-                let _ = weave_core::git::ensure_locally_excluded(repo_root, ".weave/");
+        let target;
+        let (path, _lock) = match self.write_lock.take() {
+            Some(lock) => (self.path.as_path(), lock),
+            None => {
+                target = Self::state_target(&self.path)?;
+                let lock = Self::lock_file(&target, &self.path)?;
+                if Self::read_file(&target)? != self.saved_bytes {
+                    return Err(WeaveError::StateChanged(self.path.clone()));
+                }
+                (target.as_path(), lock)
             }
+        };
+        let heads = self.doc.get_heads();
+        if self.saved_bytes.is_some() && heads == self.saved_heads {
+            return Ok(());
         }
         let data = self.doc.save();
-        std::fs::write(&self.path, data)?;
+        // A rename only needs directory access. Check that the existing state
+        // file itself is writable before replacing it.
+        let permissions = match File::options().write(true).open(path) {
+            Ok(file) => {
+                let metadata = file.metadata()?;
+                let permissions = metadata.permissions();
+                if permissions.readonly() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "state file is read-only",
+                    )
+                    .into());
+                }
+                #[cfg(unix)]
+                let hard_linked = std::os::unix::fs::MetadataExt::nlink(&metadata) > 1;
+                #[cfg(windows)]
+                let hard_linked = Self::has_hard_links(&file)?;
+                #[cfg(any(unix, windows))]
+                if hard_linked {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "cannot atomically replace hard-linked state; use a symlink for shared state",
+                    )
+                    .into());
+                }
+                Some(permissions)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let mut temp = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
+        if let Some(permissions) = permissions {
+            temp.as_file().set_permissions(permissions)?;
+        }
+        temp.write_all(&data)?;
+        temp.persist(path).map_err(|e| e.error)?;
+        self.saved_bytes = Some(data);
+        self.saved_heads = heads;
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn has_hard_links(file: &File) -> io::Result<bool> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the live file supplies a valid handle and info is writable.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.nNumberOfLinks > 1)
     }
 
     /// The ExId of a top-level root object, or a `WeaveError` naming what's

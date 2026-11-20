@@ -14,6 +14,9 @@ pub enum WeaveError {
     #[error("entity not in conflict: {0}")]
     NotInConflict(String),
 
+    #[error("state at {} changed since it was opened; reopen it and retry the update", .0.display())]
+    StateChanged(std::path::PathBuf),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

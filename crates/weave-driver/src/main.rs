@@ -820,7 +820,7 @@ fn record_merge_in_crdt(file_path: &str, _merged_content: &str) {
         if !state_path.exists() {
             return Ok(());
         }
-        let mut state = weave_crdt::EntityStateDoc::open(&state_path)?;
+        let mut state = weave_crdt::EntityStateDoc::open_for_update(&state_path)?;
         let registry = sem_core::parser::plugins::create_default_registry();
         weave_crdt::sync_from_files(&mut state, &repo_root, &[file_path.to_string()], &registry)?;
         state.save()?;

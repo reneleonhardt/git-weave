@@ -28,8 +28,20 @@ use crate::tools::*;
 /// Lazily-initialized repo context. Created on the first tool call that
 /// lands in its repository.
 struct RepoContext {
-    state: Mutex<EntityStateDoc>,
+    state_path: PathBuf,
     repo_root: PathBuf,
+}
+
+impl RepoContext {
+    fn open_state(&self) -> Result<EntityStateDoc, ToolError> {
+        EntityStateDoc::open(&self.state_path)
+            .map_err(|e| Reason::state(&self.state_path, e).into())
+    }
+
+    fn open_state_for_update(&self) -> Result<EntityStateDoc, ToolError> {
+        EntityStateDoc::open_for_update(&self.state_path)
+            .map_err(|e| Reason::state(&self.state_path, e).into())
+    }
 }
 
 /// Every repository this server has answered for, keyed by canonical root.
@@ -184,24 +196,14 @@ impl WeaveServer {
                 },
             },
         };
-        // Keyed canonically, so a symlinked spelling of a repository already
-        // open does not open its state file a second time.
+        // Use one context for all spellings of the same repository root.
         let key = std::fs::canonicalize(&repo_root).unwrap_or_else(|_| repo_root.clone());
-        if !guard.by_root.contains_key(&key) {
-            let state_path = repo_root.join(".weave").join("state.automerge");
-            let state =
-                EntityStateDoc::open(&state_path).map_err(|e| Reason::state(&state_path, e))?;
-            guard.by_root.insert(
-                key.clone(),
-                RepoContext {
-                    state: Mutex::new(state),
-                    repo_root,
-                },
-            );
-        }
         guard.last_root = Some(key.clone());
         Ok(tokio::sync::MutexGuard::map(guard, |c| {
-            c.by_root.get_mut(&key).unwrap()
+            c.by_root.entry(key).or_insert_with(|| RepoContext {
+                state_path: repo_root.join(".weave").join("state.automerge"),
+                repo_root,
+            })
         }))
     }
 
@@ -576,8 +578,8 @@ impl WeaveServer {
             params.ordinal,
         )?;
 
-        let mut state = ctx.state.lock().await;
         let entities = self.cached_extract_entities(&content, &rel_path).await;
+        let mut state = ctx.open_state_for_update()?;
         if let Some(e) = entities.iter().find(|e| e.id == entity_id) {
             let _ = upsert_entity(
                 &mut state,
@@ -591,7 +593,7 @@ impl WeaveServer {
 
         let result = claim_entity(&mut state, &params.agent_id, &entity_id).map_err(crdt_err)?;
 
-        let _ = state.save();
+        state.save().map_err(crdt_err)?;
 
         // Predictive conflict detection: check if any entity in the
         // dependency chain is claimed by another agent
@@ -692,9 +694,9 @@ impl WeaveServer {
             )?,
         };
 
-        let mut state = ctx.state.lock().await;
+        let mut state = ctx.open_state_for_update()?;
         release_entity(&mut state, &params.agent_id, &entity_id).map_err(crdt_err)?;
-        let _ = state.save();
+        state.save().map_err(crdt_err)?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
             "Released successfully",
@@ -712,7 +714,7 @@ impl WeaveServer {
         let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, &params.file_path);
         let content = Self::read_file_at(&abs_path, &rel_path)?;
 
-        let mut state = ctx.state.lock().await;
+        let mut state = ctx.open_state()?;
         let _ = sync_from_files(
             &mut state,
             &ctx.repo_root,
@@ -767,7 +769,7 @@ impl WeaveServer {
             params.ordinal,
         )?;
 
-        let state = ctx.state.lock().await;
+        let state = ctx.open_state()?;
         match get_entity_status(&state, &entity_id) {
             Ok(status) => {
                 let result = serde_json::json!({
@@ -800,7 +802,7 @@ impl WeaveServer {
         Parameters(params): Parameters<PotentialConflictsParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let ctx = self.get_repo_context().await?;
-        let state = ctx.state.lock().await;
+        let state = ctx.open_state()?;
         let mut conflicts = detect_potential_conflicts(&state).map_err(crdt_err)?;
 
         if let Some(ref agent_id) = params.agent_id {
@@ -1137,7 +1139,7 @@ impl WeaveServer {
         Parameters(params): Parameters<AgentRegisterParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let ctx = self.get_repo_context().await?;
-        let mut state = ctx.state.lock().await;
+        let mut state = ctx.open_state_for_update()?;
         register_agent(
             &mut state,
             &params.agent_id,
@@ -1145,7 +1147,7 @@ impl WeaveServer {
             &params.branch,
         )
         .map_err(crdt_err)?;
-        let _ = state.save();
+        state.save().map_err(crdt_err)?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Agent '{}' registered on branch '{}'",
@@ -1161,10 +1163,10 @@ impl WeaveServer {
         Parameters(params): Parameters<AgentHeartbeatParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let ctx = self.get_repo_context().await?;
-        let mut state = ctx.state.lock().await;
+        let mut state = ctx.open_state_for_update()?;
         weave_crdt::agent_heartbeat(&mut state, &params.agent_id, &params.working_on)
             .map_err(crdt_err)?;
-        let _ = state.save();
+        state.save().map_err(crdt_err)?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text("OK")]))
     }
@@ -1730,8 +1732,6 @@ impl WeaveServer {
         // Compute content hash
         let hash = format!("{:x}", content_hash_u64(&params.content));
 
-        let mut state = ctx.state.lock().await;
-
         // Ensure entity exists in CRDT. Same reasoning as the resolution
         // fallback above: a just-created entity is only in the caller's own
         // file yet, and without the upsert the CRDT write below fails
@@ -1742,6 +1742,7 @@ impl WeaveServer {
                 entities = self.cached_extract_entities(ours, &rel_path).await;
             }
         }
+        let mut state = ctx.open_state_for_update()?;
         if let Some(e) = entities.iter().find(|e| e.id == entity_id) {
             let _ = upsert_entity(
                 &mut state,
@@ -1761,7 +1762,7 @@ impl WeaveServer {
             &hash,
         )
         .map_err(crdt_err)?;
-        let _ = state.save();
+        state.save().map_err(crdt_err)?;
 
         let status = get_entity_content(&state, &entity_id).map_err(crdt_err)?;
 
@@ -1818,7 +1819,7 @@ impl WeaveServer {
             params.ordinal,
         )?;
 
-        let state = ctx.state.lock().await;
+        let state = ctx.open_state()?;
         match get_entity_content(&state, &entity_id) {
             Ok(status) => {
                 let response = serde_json::json!({
@@ -1858,7 +1859,7 @@ impl WeaveServer {
         let ctx = self.get_context(Some(&params.file_path)).await?;
         let (rel_path, _abs_path) = Self::resolve_file_path(&ctx.repo_root, &params.file_path);
 
-        let mut state = ctx.state.lock().await;
+        let mut state = ctx.open_state_for_update()?;
 
         // Sync from working tree first
         let _ = sync_from_files(
@@ -1869,7 +1870,7 @@ impl WeaveServer {
         );
 
         let result = merge_file_entities(&state, &rel_path).map_err(crdt_err)?;
-        let _ = state.save();
+        state.save().map_err(crdt_err)?;
 
         let response = serde_json::json!({
             "file_path": result.file_path,
@@ -1906,7 +1907,7 @@ impl WeaveServer {
 
         let hash = format!("{:x}", content_hash_u64(&params.resolved_content));
 
-        let mut state = ctx.state.lock().await;
+        let mut state = ctx.open_state_for_update()?;
         resolve_entity_conflict(
             &mut state,
             &params.agent_id,
@@ -1915,7 +1916,7 @@ impl WeaveServer {
             &hash,
         )
         .map_err(crdt_err)?;
-        let _ = state.save();
+        state.save().map_err(crdt_err)?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::json!({
@@ -2323,7 +2324,7 @@ mod resolve_entity_for_graph_tests {
         let before = fs::metadata(&path).unwrap();
         let registry = create_default_registry();
         let ctx = RepoContext {
-            state: Mutex::new(EntityStateDoc::open(&root.join("state.automerge")).unwrap()),
+            state_path: root.join("state.automerge"),
             repo_root: root.clone(),
         };
         let first = WeaveServer::repo_graph(&ctx, &registry);
@@ -2695,6 +2696,55 @@ mod claim_by_id_tests {
 
     const ORIGINAL: &str = "function foo(): string {\n  return \"x\";\n}\n";
     const RENAMED: &str = "function bar(): string {\n  return \"x\";\n}\n";
+
+    #[tokio::test]
+    async fn extracting_entities_does_not_open_coordination_state() {
+        let root = git_fixture("corrupt-state", &[("a.ts", ORIGINAL)]);
+        fs::create_dir(root.join(".weave")).unwrap();
+        fs::write(root.join(".weave/state.automerge"), b"damaged").unwrap();
+        let file_path = root.join("a.ts").to_str().unwrap().to_owned();
+        let server = WeaveServer::new();
+        let extracted = server
+            .weave_extract_entities(Parameters(ExtractEntitiesParams {
+                file_path: file_path.clone(),
+            }))
+            .await;
+        assert!(extracted.is_ok(), "{extracted:?}");
+        let status = server
+            .weave_status(Parameters(StatusParams { file_path }))
+            .await;
+        assert!(status.is_err(), "{status:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_servers_cannot_claim_the_same_entity() {
+        let root = git_fixture("two-claimants", &[("a.ts", ORIGINAL)]);
+        let file = root.join("a.ts").to_str().unwrap().to_owned();
+        let second = WeaveServer::new();
+        drop(second.get_context(Some(&file)).await.unwrap());
+        let params = |agent: &str| {
+            Parameters(ClaimEntityParams {
+                agent_id: agent.into(),
+                file_path: file.clone(),
+                entity_name: "foo".into(),
+                entity_type: None,
+                parent_name: None,
+                ordinal: None,
+            })
+        };
+        WeaveServer::new()
+            .weave_claim_entity(params("first"))
+            .await
+            .unwrap();
+        let result = second.weave_claim_entity(params("second")).await.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(
+            json["result"],
+            serde_json::json!({"AlreadyClaimed": {"by": "first"}})
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     /// Claim `foo`, capture the entity_id from the response, rename the
     /// entity on disk. The claim-time id must keep addressing the claim:
