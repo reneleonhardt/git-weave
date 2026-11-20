@@ -1130,7 +1130,6 @@ pub(crate) fn coalesce_adjacent_boxes(content: &str, fmt: &MarkerFormat) -> Stri
     if boxes.nth(1).is_none() {
         return content.to_string();
     }
-    let trailing_newline = content.ends_with('\n');
 
     let mut out: Vec<Piece> = Vec::new();
     for piece in pieces {
@@ -1164,7 +1163,7 @@ pub(crate) fn coalesce_adjacent_boxes(content: &str, fmt: &MarkerFormat) -> Stri
         }
     }
 
-    write_pieces(&out, fmt, trailing_newline)
+    write_pieces(&out, fmt, content)
 }
 
 /// Attach a member separator to the shared suffix, or to each present alternative
@@ -1194,14 +1193,77 @@ pub(crate) fn separated_conflict(content: &str, fmt: &MarkerFormat, separator: &
         }
         break;
     }
-    write_pieces(&pieces, fmt, content.ends_with('\n'))
+    write_pieces(&pieces, fmt, content)
 }
 
-/// Keep the source line merge's hunk boundaries when a JSON separator spans members.
-pub(crate) fn format_member_hunks(content: &str, fmt: &MarkerFormat) -> String {
+/// Render valid JSON alternatives, coupling the choices when a member owns its neighbour's comma.
+pub(crate) fn format_member_hunks(
+    content: &str,
+    fmt: &MarkerFormat,
+    sources: [&str; 3],
+    coupled: bool,
+) -> String {
     let scope = crate::merge::ScopeMarkers::inside(fmt, "", "", "member_separator");
-    let mut out = String::new();
-    for piece in read_pieces(content, &MarkerFormat::standard(7)) {
+    let pieces = read_pieces(content, &MarkerFormat::standard(7));
+    // A type change can send the merge straight here, before the entity
+    // renderer sees that choosing deletion also changes the preceding comma.
+    let coupled = coupled
+        || pieces.windows(3).any(|window| {
+            matches!(window, [Piece::Box(_), Piece::Frame(gap), Piece::Box(next)]
+                if (next.ours.is_empty() || next.theirs.is_empty())
+                    && gap.iter().all(|line| line.trim().is_empty()
+                        || crate::binding::is_trivia_line(line)))
+        });
+    // A line merge can split a separator from its member at an unchanged
+    // blank or comment line. Validate the documents each choice would keep.
+    let mut resolutions = sources.map(std::borrow::Cow::Borrowed);
+    let render = |sides: [Option<&str>; 3]| {
+        crate::merge::scoped_conflict_sides("JSON members", sides, false, false, &scope)
+    };
+    for (side, resolution) in [BoxSide::Base, BoxSide::Ours, BoxSide::Theirs]
+        .into_iter()
+        .zip(&mut resolutions)
+    {
+        if matches!(side, BoxSide::Base) && fmt.enhanced && !coupled {
+            continue;
+        }
+        let lines = pieces
+            .iter()
+            .flat_map(|piece| match piece {
+                Piece::Frame(lines) => lines.as_slice(),
+                Piece::Box(b) => match side {
+                    BoxSide::Ours => &b.ours,
+                    BoxSide::Theirs => &b.theirs,
+                    BoxSide::Base => b.base.as_deref().unwrap_or(&[]),
+                },
+            })
+            .map(String::as_str);
+        let source = resolution.as_ref();
+        if (!coupled || source.ends_with('\n')) && lines.clone().eq(source.lines()) {
+            continue;
+        }
+        let mut doc = String::with_capacity(source.len());
+        for line in lines {
+            doc.push_str(line);
+            doc.push('\n');
+        }
+        let strict = |s: &str| serde_json::from_str::<serde_json::Value>(s).is_ok();
+        if !strict(&doc)
+            && (strict(source)
+                || (crate::datafile::json_keys(&doc).is_err()
+                    && crate::datafile::json_keys(source).is_ok()))
+        {
+            return render(sources.map(Some));
+        }
+        if coupled {
+            *resolution = doc.into();
+        }
+    }
+    if coupled {
+        return render(resolutions.each_ref().map(|doc| Some(doc.as_ref())));
+    }
+    let mut out = String::with_capacity(content.len());
+    for piece in pieces {
         match piece {
             Piece::Frame(lines) => {
                 for line in lines {
@@ -1209,15 +1271,11 @@ pub(crate) fn format_member_hunks(content: &str, fmt: &MarkerFormat) -> String {
                     out.push('\n');
                 }
             }
-            Piece::Box(b) => out.push_str(&crate::merge::scoped_conflict_marker(
-                "JSON members",
+            Piece::Box(b) => out.push_str(&render([
                 b.base.as_ref().map(|lines| lines.join("\n")).as_deref(),
                 Some(&b.ours.join("\n")),
                 Some(&b.theirs.join("\n")),
-                false,
-                false,
-                &scope,
-            )),
+            ])),
         }
     }
     if !content.ends_with('\n') {
@@ -1226,8 +1284,8 @@ pub(crate) fn format_member_hunks(content: &str, fmt: &MarkerFormat) -> String {
     out
 }
 
-fn write_pieces(pieces: &[Piece], fmt: &MarkerFormat, trailing_newline: bool) -> String {
-    let mut s = String::new();
+fn write_pieces(pieces: &[Piece], fmt: &MarkerFormat, content: &str) -> String {
+    let mut s = String::with_capacity(content.len());
     for piece in pieces {
         match piece {
             Piece::Frame(lines) => {
@@ -1264,7 +1322,7 @@ fn write_pieces(pieces: &[Piece], fmt: &MarkerFormat, trailing_newline: bool) ->
             }
         }
     }
-    if !trailing_newline {
+    if !content.ends_with('\n') {
         while s.ends_with('\n') {
             s.pop();
         }

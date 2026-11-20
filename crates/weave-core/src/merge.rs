@@ -2709,15 +2709,13 @@ pub(crate) fn scoped_conflict_marker(
     scope: &ScopeMarkers<'_>,
 ) -> String {
     let fmt = scope.fmt;
-    let open = "<".repeat(fmt.marker_length);
-    let sep = "=".repeat(fmt.marker_length);
-    let close = ">".repeat(fmt.marker_length);
-
     // A large both-modified scope is first offered to the line-level
     // refinement, which boxes only the hunks that overlap and applies the rest.
     if let (Some(b), Some(o), Some(t), false, false) =
         (base, ours, theirs, ours_deleted, theirs_deleted)
     {
+        let open = "<".repeat(fmt.marker_length);
+        let close = ">".repeat(fmt.marker_length);
         let (header, footer) = if fmt.enhanced {
             let complexity = crate::conflict::classify_conflict(base, ours, theirs);
             (
@@ -2745,6 +2743,28 @@ pub(crate) fn scoped_conflict_marker(
             return refined;
         }
     }
+
+    scoped_conflict_sides(
+        name,
+        [base, ours, theirs],
+        ours_deleted,
+        theirs_deleted,
+        scope,
+    )
+}
+
+/// Keep dependent source edits in one decision, including any shared lines between them.
+pub(crate) fn scoped_conflict_sides(
+    name: &str,
+    [base, ours, theirs]: [Option<&str>; 3],
+    ours_deleted: bool,
+    theirs_deleted: bool,
+    scope: &ScopeMarkers<'_>,
+) -> String {
+    let fmt = scope.fmt;
+    let open = "<".repeat(fmt.marker_length);
+    let sep = "=".repeat(fmt.marker_length);
+    let close = ">".repeat(fmt.marker_length);
 
     // ONE cut, the same one `EntityConflict::to_conflict_markers` takes. This
     // function used to carry its own copy of the narrowing, and a copy of a rule

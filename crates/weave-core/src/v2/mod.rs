@@ -166,11 +166,10 @@ impl Analysis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::{resolve_conflicts, Resolution};
 
     #[test]
     fn json_conflict_separator_survives_either_resolution() {
-        use crate::frame::{resolve_conflicts, Resolution};
-
         let check = |[base, ours, theirs]: [String; 3]| {
             for fmt in [MarkerFormat::default(), MarkerFormat::standard(11)] {
                 let result = crate::merge::entity_merge_fmt(
@@ -255,6 +254,15 @@ mod tests {
             nested.replace("\"y\": 1", "\"y\": 3"),
         ]);
 
+        for gap in ["\n", "  // shared comment\n"] {
+            let doc = |comma, last| format!("{{\n  \"a\": 1{comma}\n{gap}{last}}}\n");
+            check([
+                doc(",", "  \"b\": 1\n"),
+                doc("", ""),
+                doc(",", "  \"b\": 2\n"),
+            ]);
+        }
+
         let siblings = "  \"a\": 0,\n  \"b\": 1,\n  \"c\": 2,\n  \"d\": 3";
         check([
             format!("{{\n  \"old\": 4,\n{siblings}\n}}\n"),
@@ -273,6 +281,35 @@ mod tests {
             "{\"a\":{\"id\":N},\"b\":{\"id\":2}}\n",
         ] {
             check(["1", "2", "3"].map(|n| template.replace('N', n)));
+        }
+    }
+
+    #[test]
+    fn deleting_the_last_member_and_its_comma_is_one_choice() {
+        for gap in ["\n", "  // shared comment\n"] {
+            let doc = |first, tail| format!("{{\n  \"a\": {first}\n{gap}{tail}}}\n");
+            let base = doc("1,", "  \"b\": 1\n");
+            let keep = doc("3,", "  \"b\": 3\n");
+            for first in ["2", "{}"] {
+                let delete = doc(first, "");
+                for (ours, theirs) in [(&delete, &keep), (&keep, &delete)] {
+                    let result = crate::merge::entity_merge(&base, ours, theirs, "x.json");
+                    assert_eq!(
+                        result
+                            .content
+                            .lines()
+                            .filter(|l| l.starts_with("<<<<<<<"))
+                            .count(),
+                        1,
+                        "{}",
+                        result.content
+                    );
+                    for (side, expected) in [(Resolution::Ours, ours), (Resolution::Theirs, theirs)]
+                    {
+                        assert_eq!(resolve_conflicts(&result.content, side), *expected);
+                    }
+                }
+            }
         }
     }
 
@@ -474,20 +511,23 @@ pub(crate) fn merge_file(
     let line_merge = |required: Option<&EntityConflict>| {
         let mut result = crate::merge::line_level_fallback(base, ours, theirs, file_path, host);
         if !result.is_clean() {
-            result.content = crate::conflict::format_member_hunks(&result.content, marker_format);
+            result.content = crate::conflict::format_member_hunks(
+                &result.content,
+                marker_format,
+                [base, ours, theirs],
+                required.is_some(),
+            );
         } else if let Some(conflict) = required {
-            // Moving an edited member can turn its deletion into a clean line
-            // merge. Keep the structural conflict and both source spellings.
-            result.content = crate::merge::scoped_conflict_marker(
+            // The predecessor and the optional member require one decision,
+            // even when a shared blank or comment line separates them.
+            result.content = crate::merge::scoped_conflict_sides(
                 &conflict.entity_name,
-                Some(base),
-                Some(ours),
-                Some(theirs),
+                [Some(base), Some(ours), Some(theirs)],
                 false,
                 false,
                 &crate::merge::ScopeMarkers::inside(marker_format, "", "", "member_separator"),
             );
-            result.conflicts.push(conflict.clone());
+            result.conflicts = vec![conflict.clone()];
             result.stats.entities_conflicted = 1;
         }
         result.content = restore.apply(result.content);
