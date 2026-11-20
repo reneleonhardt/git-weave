@@ -176,6 +176,45 @@ mod tests {
     }
 
     #[test]
+    fn latex_row_separator_follows_the_retained_row() {
+        use crate::frame::{resolve_conflicts, Resolution};
+        for gap in ["", "\n", "% row comment\n"] {
+            let table = |row: &str| {
+                format!("\\section{{Test}}\n\\begin{{tabular}}{{ll}}\nOne & two{row}\n\\end{{tabular}}\n")
+            };
+            let base = table(&format!(" \\\\\n{gap}Three & four"));
+            let edited = base.replace("four", "five");
+            for removed in [table(""), table(r" \\")] {
+                for (ours, theirs) in [(&edited, &removed), (&removed, &edited)] {
+                    for fmt in [
+                        MarkerFormat {
+                            marker_length: 11,
+                            ..MarkerFormat::default()
+                        },
+                        MarkerFormat::standard(3),
+                    ] {
+                        let r = crate::merge::entity_merge_fmt(
+                            &base,
+                            ours,
+                            theirs,
+                            "paper.tex",
+                            &fmt.clone().for_file("paper.tex"),
+                            &Host::default(),
+                        );
+                        if fmt.enhanced {
+                            assert!(r.content.contains("% refused_by:"));
+                            assert_eq!(crate::parse_weave_conflicts(&r.content).len(), 1);
+                        }
+                        assert!(!r.is_clean());
+                        assert_eq!(&resolve_conflicts(&r.content, Resolution::Ours), ours);
+                        assert_eq!(&resolve_conflicts(&r.content, Resolution::Theirs), theirs);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_one_sided_crlf_conversion_is_reported_as_an_encoding_change() {
         assert!(encoding_differs("a\n", "a\r\n", "a\n"));
         assert!(!encoding_differs("a\n", "a\n", "a\n"));

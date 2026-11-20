@@ -281,6 +281,7 @@ fn line_comment_prefix(file_path: &str) -> &'static str {
         // semicolon comment languages
         "clj" | "cljs" | "cljc" | "edn" | "lisp" | "lsp" | "el" | "scm" | "ss" | "rkt" | "asm"
         | "s" => ";",
+        "tex" | "latex" | "cls" | "sty" => "%",
         // C-family and friends (also the safe default)
         _ => "//",
     }

@@ -1113,6 +1113,38 @@ fn statement_merge_inner(
     let ours_align = align(&b, &o)?;
     let theirs_align = align(&b, &t)?;
 
+    // A deleted statement can own the separator at the end of its predecessor
+    // (e.g. a LaTeX table row). Keep both edits in the same decision.
+    let coupled = |side: &Alignment, peer: &Alignment, part: &Partition| {
+        let mut changed = b.header != part.header || b.prelude != part.prelude;
+        for ((action, other), before) in side.per_base.iter().zip(&peer.per_base).zip(&b.parts) {
+            match action {
+                Action::Deleted if changed && matches!(other, Action::Edited(_)) => return true,
+                Action::Deleted => changed = true,
+                Action::Edited(i) => {
+                    changed =
+                        before.text.lines().next_back() != part.parts[*i].text.lines().next_back()
+                }
+                Action::Unchanged => changed = false,
+            }
+        }
+        false
+    };
+    if coupled(&ours_align, &theirs_align, &o) || coupled(&theirs_align, &ours_align, &t) {
+        return Some(InnerMergeResult {
+            content: crate::merge::scoped_conflict_sides(
+                "statements",
+                Some(base),
+                Some(ours),
+                Some(theirs),
+                false,
+                false,
+                fmt,
+            ),
+            has_conflicts: true,
+        });
+    }
+
     // Mint the claims. From here on a statement is reached only through the
     // claim that names it, and a claim is spent once.
     let base_claims: Vec<BasePart> = b.claims(BasePart::new);
@@ -1230,12 +1262,9 @@ fn statement_merge_inner(
         let (op, tp) = (ao.part(), at.part());
         let name = label(&bp.text);
 
-        // The lead is decided by the versions that still HAVE the statement. A
-        // version that deleted it did not empty the gap in front of it.
+        // A deleted statement's leading lines belong inside its side of the box.
         let lead = match (&ao, &at) {
-            (SideEdit::Deleted, SideEdit::Deleted) => None,
-            (SideEdit::Deleted, _) => Some(tp.map(|p| p.lead.clone()).unwrap_or(bp.lead.clone())),
-            (_, SideEdit::Deleted) => Some(op.map(|p| p.lead.clone()).unwrap_or(bp.lead.clone())),
+            (SideEdit::Deleted, _) | (_, SideEdit::Deleted) => None,
             _ => {
                 let lo = op.map(|p| p.lead.as_str()).unwrap_or(&bp.lead);
                 let lt = tp.map(|p| p.lead.as_str()).unwrap_or(&bp.lead);
@@ -1328,8 +1357,8 @@ fn statement_merge_inner(
                 has_conflict = true;
                 Some(scoped_conflict_marker(
                     &name,
-                    Some(&bp.text),
-                    Some(&po.text),
+                    Some(&render(bp)),
+                    Some(&render(po)),
                     None,
                     false,
                     true,
@@ -1340,9 +1369,9 @@ fn statement_merge_inner(
                 has_conflict = true;
                 Some(scoped_conflict_marker(
                     &name,
-                    Some(&bp.text),
+                    Some(&render(bp)),
                     None,
-                    Some(&pt.text),
+                    Some(&render(pt)),
                     true,
                     false,
                     fmt,
