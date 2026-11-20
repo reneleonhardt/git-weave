@@ -13,14 +13,10 @@ use weave_core::merge::STRUCTURE_LIMIT_BYTES;
 
 pub(crate) static REGISTRY: LazyLock<ParserRegistry> = LazyLock::new(create_default_registry);
 
-/// Does weave have a real grammar for this path?
-///
-/// `get_explicit_plugin` deliberately refuses the fallback (20-line chunk)
-/// plugin: entity reasoning over arbitrary chunks is worse than no entity
-/// reasoning, so unsupported files inherit git's guarantees wholesale
-/// instead of a guess dressed up as structure.
+/// Check files that have a data reader or a grammar specific to their format.
 pub(crate) fn is_supported(path: &str) -> bool {
-    REGISTRY.get_explicit_plugin(path).is_some()
+    weave_core::datafile::format_name(path).is_some()
+        || REGISTRY.get_explicit_plugin(path).is_some()
 }
 
 /// Is this path a programming language, where names are bound and referenced?

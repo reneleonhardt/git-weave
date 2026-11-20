@@ -515,6 +515,7 @@ pub(crate) fn merge_file(
                 &result.content,
                 marker_format,
                 [base, ours, theirs],
+                file_path,
                 required.is_some(),
             );
         } else if let Some(conflict) = required {

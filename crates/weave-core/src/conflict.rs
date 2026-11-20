@@ -1201,6 +1201,7 @@ pub(crate) fn format_member_hunks(
     content: &str,
     fmt: &MarkerFormat,
     sources: [&str; 3],
+    file_path: &str,
     coupled: bool,
 ) -> String {
     let scope = crate::merge::ScopeMarkers::inside(fmt, "", "", "member_separator");
@@ -1248,11 +1249,8 @@ pub(crate) fn format_member_hunks(
             doc.push('\n');
         }
         let strict = |s: &str| serde_json::from_str::<serde_json::Value>(s).is_ok();
-        if !strict(&doc)
-            && (strict(source)
-                || (crate::datafile::json_keys(&doc).is_err()
-                    && crate::datafile::json_keys(source).is_ok()))
-        {
+        let loads = |text| crate::datafile::keys(file_path, text).is_some_and(|r| r.is_ok());
+        if !strict(&doc) && (strict(source) || (!loads(&doc) && loads(source))) {
             return render(sources.map(Some));
         }
         if coupled {

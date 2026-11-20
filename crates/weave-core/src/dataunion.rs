@@ -237,7 +237,8 @@ fn format(path: &str) -> Option<Format> {
     match crate::datafile::format_name(path)? {
         "JSON" => Some(Format::Json),
         "TOML" => Some(Format::Toml),
-        _ => Some(Format::Yaml),
+        "YAML" => Some(Format::Yaml),
+        _ => None,
     }
 }
 
@@ -587,6 +588,13 @@ mod tests {
 
     fn v(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    #[test]
+    fn key_validation_alone_does_not_certify_a_value_union() {
+        for path in ["cfg.json5", "events.jsonl", "events.ndjson"] {
+            assert!(!applies(path), "{path}");
+        }
     }
 
     #[test]

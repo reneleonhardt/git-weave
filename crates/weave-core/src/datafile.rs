@@ -14,6 +14,8 @@
 
 use std::collections::HashMap;
 
+mod json5_keys;
+
 /// `"<table path>\u{1f}<key>"` -> the most times one table at that path
 /// states the key. Array elements share the path `[]`, so inserting an
 /// element does not move every key after it.
@@ -21,9 +23,11 @@ pub type KeyTally = HashMap<String, usize>;
 
 /// The data format of `path`, if it is one weave reads keys out of.
 fn format(path: &str) -> Option<&'static str> {
-    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+    let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
     match ext.as_str() {
         "json" | "jsonc" => Some("JSON"),
+        "json5" => Some("JSON5"),
+        "jsonl" | "ndjson" => Some("JSON Lines"),
         "toml" => Some("TOML"),
         "yaml" | "yml" => Some("YAML"),
         _ => None,
@@ -35,6 +39,8 @@ fn format(path: &str) -> Option<&'static str> {
 pub fn keys(path: &str, text: &str) -> Option<Result<KeyTally, String>> {
     Some(match format(path)? {
         "JSON" => json_keys(text),
+        "JSON5" => json5_keys::parse(text),
+        "JSON Lines" => json_lines_keys(text),
         "TOML" => text
             .parse::<toml::Table>()
             .map(|_| KeyTally::new())
@@ -61,26 +67,57 @@ fn yaml_keys(text: &str) -> Result<KeyTally, String> {
 /// JSON as a person writes it for a tool: comments and trailing commas are
 /// allowed (tsconfig, VS Code settings), anything else malformed is not.
 pub(crate) fn json_keys(text: &str) -> Result<KeyTally, String> {
+    let mut tally = KeyTally::new();
+    read_json(text, &mut tally, true)?;
+    Ok(tally)
+}
+
+fn json_lines_keys(text: &str) -> Result<KeyTally, String> {
+    let mut tally = KeyTally::new();
+    for (i, line) in text.lines().enumerate() {
+        read_json(line, &mut tally, false).map_err(|e| format!("line {}: {e}", i + 1))?;
+    }
+    Ok(tally)
+}
+
+fn read_json(text: &str, tally: &mut KeyTally, relaxed: bool) -> Result<(), String> {
     let mut walk = Json {
         s: text.as_bytes(),
         i: 0,
-        tally: KeyTally::new(),
+        tally,
+        relaxed,
     };
     walk.skip();
-    if walk.i < walk.s.len() {
+    if !relaxed || walk.i < walk.s.len() {
         walk.value("", 0)?;
         walk.skip();
     }
     if walk.i < walk.s.len() {
         return Err(format!("unexpected text at byte {}", walk.i));
     }
-    Ok(walk.tally)
+    Ok(())
 }
 
 struct Json<'a> {
     s: &'a [u8],
     i: usize,
-    tally: KeyTally,
+    tally: &'a mut KeyTally,
+    relaxed: bool,
+}
+
+fn record_object(tally: &mut KeyTally, path: &str, counts: KeyTally) {
+    for (key, count) in counts {
+        let n = tally.entry(format!("{path}\u{1f}{key}")).or_default();
+        *n = (*n).max(count);
+    }
+}
+
+fn object_path(path: &str, key: &str) -> String {
+    if key.contains(['.', '[', ']', '\u{1f}']) {
+        format!("{path}[{}]", serde_json::to_string(key).unwrap())
+    } else {
+        format!("{path}.{key}")
+    }
 }
 
 /// Deeper than this is not a file a person merges; refuse to guess.
@@ -97,6 +134,9 @@ impl Json<'_> {
             while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
                 self.i += 1;
             }
+            if !self.relaxed {
+                return;
+            }
             if self.s[self.i..].starts_with(b"//") {
                 while self.peek().is_some_and(|b| !matches!(b, b'\n' | b'\r')) {
                     self.i += 1;
@@ -110,6 +150,17 @@ impl Json<'_> {
                 return;
             }
         }
+    }
+
+    fn comma(&mut self, close: u8) -> Result<(), String> {
+        self.i += 1;
+        if !self.relaxed {
+            self.skip();
+            if self.peek() == Some(close) {
+                return Err(self.error("trailing comma"));
+            }
+        }
+        Ok(())
     }
 
     fn error(&self, what: &str) -> String {
@@ -156,7 +207,7 @@ impl Json<'_> {
 
     fn object(&mut self, path: &str, depth: usize) -> Result<(), String> {
         self.i += 1; // {
-        let mut here: HashMap<String, usize> = HashMap::new();
+        let mut here = KeyTally::new();
         loop {
             self.skip();
             match self.peek() {
@@ -177,24 +228,19 @@ impl Json<'_> {
             // A literal "a.b" or "rows[]" belongs to a different object than a nested path.
             let inner = if !matches!(self.peek(), Some(b'{' | b'[')) {
                 String::new()
-            } else if key.contains(['.', '[', ']', '\u{1f}']) {
-                format!("{path}[{}]", serde_json::Value::String(key.clone()))
             } else {
-                format!("{path}.{key}")
+                object_path(path, &key)
             };
             self.value(&inner, depth + 1)?;
             *here.entry(key).or_insert(0) += 1;
             self.skip();
             match self.peek() {
-                Some(b',') => self.i += 1,
+                Some(b',') => self.comma(b'}')?,
                 Some(b'}') => {}
                 _ => return Err(self.error("expected `,` or `}`")),
             }
         }
-        for (key, n) in here {
-            let slot = self.tally.entry(format!("{path}\u{1f}{key}")).or_insert(0);
-            *slot = (*slot).max(n);
-        }
+        record_object(self.tally, path, here);
         Ok(())
     }
 
@@ -210,7 +256,7 @@ impl Json<'_> {
             self.value(&inner, depth + 1)?;
             self.skip();
             match self.peek() {
-                Some(b',') => self.i += 1,
+                Some(b',') => self.comma(b']')?,
                 Some(b']') => {}
                 _ => return Err(self.error("expected `,` or `]`")),
             }
@@ -253,10 +299,54 @@ mod tests {
     #[test]
     fn json_for_tools_may_carry_comments_and_trailing_commas() {
         let t = tally(
-            "tsconfig.json",
+            "settings.JSONC",
             "// settings\n{\n  /* strict */ \"strict\": true,\n  \"paths\": [\"a\",],\n}\n",
         );
         assert_eq!(t["\u{1f}strict"], 1);
+    }
+
+    #[test]
+    fn json5_counts_decoded_member_names_in_their_object() {
+        let data = r#"{/* config */ rows: [{a: +.5}, {'a': Infinity, "\u0061": 0xff}], 'rows[]': {a: NaN}, ok: true, end: null, \u0062: -1, b: 2,}"#;
+        let keys = tally("config.JsOn5", data);
+        assert_eq!(keys[".rows[]\u{1f}a"], 2);
+        assert_eq!(keys["\u{1f}b"], 2);
+        assert_eq!(keys["[\"rows[]\"]\u{1f}a"], 1);
+        assert!(super::keys("config.jsonc", data).unwrap().is_err());
+        assert!(super::keys("json5", data).is_none());
+        for bad in ["{a:}", "{} {}", "/*", ""] {
+            assert!(super::keys("config.json5", bad).unwrap().is_err(), "{bad}");
+        }
+        let deep = format!(
+            "{}0{}",
+            "[".repeat(MAX_DEPTH + 1),
+            "]".repeat(MAX_DEPTH + 1)
+        );
+        assert!(super::keys("config.json5", &deep).unwrap().is_err());
+    }
+
+    #[test]
+    fn json_lines_counts_keys_per_record_and_requires_one_value_per_line() {
+        for path in ["events.JSONL", "events.ndjson"] {
+            let data = "{\"id\":1}\r\n{\"id\":2, \"nested\":{\"k\":1,\"k\":2}}\nnull\n";
+            let keys = tally(path, data);
+            assert_eq!(keys["\u{1f}id"], 1);
+            assert_eq!(keys[".nested\u{1f}k"], 2);
+            for line in [
+                "",
+                "\u{feff}{}",
+                "{\"k\":1,}",
+                "[1,]",
+                "// note",
+                "{",
+                "true false",
+            ] {
+                let error = super::keys(path, &format!("0\n{line}\n"))
+                    .unwrap()
+                    .unwrap_err();
+                assert!(error.starts_with("line 2:"), "{line:?}: {error}");
+            }
+        }
     }
 
     #[test]
