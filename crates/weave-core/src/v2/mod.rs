@@ -663,8 +663,13 @@ pub(crate) fn merge_file(
 
     let separator = entity_separator(file_path);
     let line_merge = |required: Option<&EntityConflict>| {
-        let mut result =
-            crate::merge::line_level_fallback(base, ours, theirs, marker_format.marker_length, host);
+        let mut result = crate::merge::line_level_fallback(
+            base,
+            ours,
+            theirs,
+            marker_format.marker_length,
+            host,
+        );
         if !result.is_clean() {
             result.content = crate::conflict::format_member_hunks(
                 &result.content,
