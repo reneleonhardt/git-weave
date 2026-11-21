@@ -1073,19 +1073,38 @@ mod tests {
     #[test]
     fn a_git_that_never_answers_is_an_error_not_a_wait() {
         let root = git_fixture("slow");
-        let started = std::time::Instant::now();
-        let err = within(30, move || {
+        let dir = root.clone();
+        let started = Instant::now();
+        let result = within(30, move || {
             bounded(
-                &root,
-                &["-c", "alias.stall=!sleep 20", "stall"],
+                &dir,
+                &[
+                    "-c",
+                    concat!(
+                        "alias.stall=!i=0; ",
+                        "while test \"$i\" -lt 200 && test ! -f .git/stall.stop; do ",
+                        "i=$((i + 1)); sleep 0.1; done; : > .git/stall.done",
+                    ),
+                    "stall",
+                ],
                 None,
-                std::time::Duration::from_secs(1),
+                Duration::from_secs(1),
             )
             .map_err(|e| e.to_string())
-        })
-        .expect_err("a stalled git must not succeed");
+        });
+        let elapsed = started.elapsed();
+
+        // Release the shell after testing the timeout so it closes its pipes.
+        fs::write(root.join(".git/stall.stop"), b"").expect("release stalled alias");
+        let done = root.join(".git/stall.done");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done.is_file() {
+            assert!(Instant::now() < deadline, "stalled alias did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let err = result.expect_err("a stalled git must not succeed");
         assert!(err.contains("did not finish within 1s"), "{err}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(elapsed < Duration::from_secs(10));
     }
 
     /// With no merge in progress, a merge commit at HEAD is the merge just
