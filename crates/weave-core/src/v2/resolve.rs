@@ -626,6 +626,16 @@ pub(crate) fn inner_merge(
         .as_ref()
         .map(|t| crate::merge::get_child_entities(t, ctx.theirs_all))
         .unwrap_or_default();
+    // Without declared children, the generic container falls back to treating
+    // indented lines as named members. Go literal elements can be positional.
+    if ctx.file_path.ends_with(".go")
+        && ours_e.entity_type == "variable"
+        && base_children.is_empty()
+        && ours_children.is_empty()
+        && theirs_children.is_empty()
+    {
+        return None;
+    }
     crate::container::container_merge(
         base_rc,
         ours_rc,
@@ -688,5 +698,32 @@ pub(crate) fn conflict_disposition(
         strategy,
         rename: None,
         tally: Tally::Conflicted,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn go_variable_literals_keep_positional_conflicts_and_merge_map_keys() {
+        use crate::frame::{resolve_conflicts, Resolution};
+        for ty in ["[]int", "[3]int"] {
+            let literal = |v| format!("package p\nvar x = {ty}{{\n  0,\n  {v},\n  9,\n}}\n");
+            let (ours, theirs) = (literal(2), literal(3));
+            let result = crate::merge::entity_merge(&literal(1), &ours, &theirs, "x.go");
+            assert!(!result.is_clean());
+            assert_eq!(resolve_conflicts(&result.content, Resolution::Ours), ours);
+            assert_eq!(
+                resolve_conflicts(&result.content, Resolution::Theirs),
+                theirs
+            );
+        }
+        let map = |entries: &str| {
+            format!("package p\nvar x = map[string]int{{\n  \"a\": 1,\n{entries}}}\n")
+        };
+        let b = "  \"b\": 2,\n";
+        let c = "  \"c\": 3,\n";
+        let result = crate::merge::entity_merge(&map(""), &map(b), &map(c), "x.go");
+        assert!(result.is_clean(), "{}", result.content);
+        assert_eq!(result.content, map(&format!("{b}{c}")));
     }
 }

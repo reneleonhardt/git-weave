@@ -55,6 +55,31 @@ enum Zone {
     Theirs,
 }
 
+/// Split a delimiter from its optional label. A longer run or a source word
+/// beginning with the same punctuation is not a delimiter of this width.
+fn marker(line: &str) -> Option<(u8, usize, &str)> {
+    let byte = *line.as_bytes().first()?;
+    if !matches!(byte, b'<' | b'|' | b'=' | b'>') {
+        return None;
+    }
+    let width = line.bytes().take_while(|b| *b == byte).count();
+    let tail = &line[width..];
+    let label = if tail.is_empty() {
+        ""
+    } else {
+        tail.strip_prefix(' ')?
+    };
+    if byte == b'<' && width < 7 && !matches!(label.split(' ').next(), Some("ours" | "HEAD")) {
+        return None;
+    }
+    Some((byte, width, label))
+}
+
+pub(crate) fn opening_width(line: &str) -> Option<usize> {
+    let (byte, width, _) = marker(line)?;
+    (byte == b'<').then_some(width)
+}
+
 /// Walk a conflicted file, telling each line which zone it is in.
 ///
 /// Marker lines themselves belong to no zone and are not yielded. Two other
@@ -65,21 +90,21 @@ enum Zone {
 /// content it invented, which is precisely what the frame check exists to catch.
 fn zones(content: &str) -> impl Iterator<Item = (Zone, &str)> {
     let mut zone = Zone::Frame;
+    let mut width = 0;
     content.lines().filter_map(move |line| {
-        if line.starts_with("<<<<<<<") {
-            zone = Zone::Ours;
-            return None;
-        }
-        if zone != Zone::Frame && line.starts_with("|||||||") {
-            zone = Zone::Base;
-            return None;
-        }
-        if zone != Zone::Frame && line.starts_with("=======") {
-            zone = Zone::Theirs;
-            return None;
-        }
-        if line.starts_with(">>>>>>>") {
-            zone = Zone::Frame;
+        if let Some((byte, n, label)) = marker(line) {
+            match (zone, byte) {
+                (Zone::Frame, b'<') => {
+                    width = n;
+                    zone = Zone::Ours;
+                }
+                (Zone::Ours, b'|') if n == width => zone = Zone::Base,
+                (Zone::Ours | Zone::Base, b'=') if n == width && label.is_empty() => {
+                    zone = Zone::Theirs
+                }
+                (Zone::Theirs, b'>') if n == width => zone = Zone::Frame,
+                _ => return Some((zone, line)),
+            }
             return None;
         }
         if zone == Zone::Ours && crate::conflict::refusal_body(line).is_some() {
@@ -102,10 +127,28 @@ fn zones(content: &str) -> impl Iterator<Item = (Zone, &str)> {
 /// decision to consult. `is_clean()` is the case where scanning is wrong and it
 /// does not scan.
 pub fn marker_line_count(content: &str) -> usize {
+    let mut open = None;
     content
         .lines()
-        .filter(|l| {
-            l.starts_with("<<<<<<<") || l.starts_with("=======") || l.starts_with(">>>>>>>")
+        .filter(|line| {
+            let Some((byte, width, label)) = marker(line) else {
+                return false;
+            };
+            let in_box = open == Some(width);
+            let word = label.split(' ').next().unwrap_or("");
+            match byte {
+                b'<' if open.is_none() => {
+                    open = Some(width);
+                    true
+                }
+                b'>' if in_box || (open.is_none() && (width >= 7 || word == "theirs")) => {
+                    open = None;
+                    true
+                }
+                b'|' => in_box || (open.is_none() && matches!(word, "base" | "original")),
+                b'=' => label.is_empty() && (in_box || (open.is_none() && width >= 7)),
+                _ => false,
+            }
         })
         .count()
 }
@@ -147,7 +190,7 @@ pub fn frame(content: &str) -> Vec<&str> {
 /// line quoting `<<<<<<<` is not a conflict. In here it is asked of
 /// text this pipeline just wrote, where there is no disposition to consult.
 pub(crate) fn is_conflicted(content: &str) -> bool {
-    content.lines().any(|l| l.starts_with("<<<<<<<"))
+    content.lines().any(|l| opening_width(l).is_some())
 }
 
 /// A line the frame states more times than any version of the file stated it.

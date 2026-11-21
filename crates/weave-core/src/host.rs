@@ -30,6 +30,8 @@ pub enum LineMergeStyle {
     /// entity model does not describe, where the conflicted bytes themselves
     /// are the product.
     Labelled,
+    /// Labelled diff3 with the caller's requested delimiter width.
+    LabelledWithWidth(usize),
 }
 
 /// The answer a line-level merge gave.
@@ -206,7 +208,10 @@ pub fn git_line_merge(
 
     let mut cmd = Command::new("git");
     cmd.arg("merge-file").arg("-p"); // print to stdout instead of modifying ours in place
-    if style == LineMergeStyle::Labelled {
+    if style != LineMergeStyle::Plain {
+        if let LineMergeStyle::LabelledWithWidth(width) = style {
+            cmd.arg(format!("--marker-size={width}"));
+        }
         cmd.arg("--diff3") // include the ||||||| base section, for jj compatibility
             .arg("-L")
             .arg("ours")
@@ -223,7 +228,11 @@ pub fn git_line_merge(
         .ok()?;
 
     // Exit 0 = clean; exit >0 = that many conflicts.
-    let clean = output.status.success();
+    let code = output.status.code()?;
+    if !(0..=127).contains(&code) {
+        return None;
+    }
+    let clean = code == 0;
     match style {
         // The plain style is only ever consulted for a clean answer, so a
         // conflicted one is the same as no answer.
@@ -232,7 +241,7 @@ pub fn git_line_merge(
             content: String::from_utf8(output.stdout).ok()?,
             clean: true,
         }),
-        LineMergeStyle::Labelled => Some(LineMerged {
+        LineMergeStyle::Labelled | LineMergeStyle::LabelledWithWidth(_) => Some(LineMerged {
             content: String::from_utf8_lossy(&output.stdout).into_owned(),
             clean,
         }),
@@ -307,6 +316,7 @@ mod tests {
             .expect("git answered once already");
         assert!(!conflicted.clean);
         assert!(conflicted.content.contains("<<<<<<< ours"));
+        assert!(git_line_merge(LineMergeStyle::Labelled, "b\0", "o\0", "t\0").is_none());
         // The plain style has no answer for a conflict, by design.
         assert!(git_line_merge(LineMergeStyle::Plain, base, ours, both).is_none());
     }

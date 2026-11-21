@@ -322,6 +322,160 @@ mod tests {
     }
 
     #[test]
+    fn embedded_code_preserves_separators_and_wrapper_on_either_resolution() {
+        use crate::frame::{resolve_conflicts, Resolution};
+        let java = (
+            "enum E {\n A",
+            ";",
+            " int f() { return 1; }",
+            " int f() { return 2; }",
+        );
+        let rust = ("enum E {\n A", ",", " B", " C");
+        for (path, open, close, (head, sep, old, new)) in [
+            ("x.md", "# Guide\n```java", "```", java),
+            ("x.md", "# Guide\n~~~~rust", "~~~~", rust),
+            ("X.java", "class X {\n /*", " */\n}", java),
+            (
+                "X.java",
+                "class X {\n String code = \"\"\"",
+                " \"\"\";\n}",
+                rust,
+            ),
+            (
+                "x.py",
+                "def doc():\n    \"\"\"",
+                "    \"\"\"\n    pass",
+                java,
+            ),
+            (
+                "X.java",
+                "class X { String code = \"\"\"",
+                "\"\"\"; }",
+                java,
+            ),
+            ("x.rs", "const CODE: &str = r##\"", "\"##;", java),
+            ("x.sql", "CREATE VIEW v AS\n/*", "*/\nSELECT 1;", rust),
+            (
+                "x.sql",
+                "CREATE VIEW v AS\n/* outer\n/* inner */",
+                "*/\nSELECT 1;",
+                java,
+            ),
+            (
+                "x.sql",
+                "CREATE FUNCTION f() RETURNS text AS $body$\nSELECT $code$",
+                "$code$\n$body$ LANGUAGE SQL;",
+                java,
+            ),
+            ("x.j2", "{% raw %}", "{% endraw %}", java),
+            (
+                "x.html",
+                "<article>\n{% if enabled %}",
+                "{% endif %}\n</article>",
+                rust,
+            ),
+            ("x.sql", "{% if enabled %}", "{% endif %}", java),
+        ] {
+            let doc =
+                |punct, member: &str| format!("{open}\n{head}{punct}\n\n{member}}}\n{close}\n");
+            let base = doc(sep, &format!("{old}\n"));
+            let kept = doc(sep, &format!("{new}\n"));
+            let deleted = doc("", "");
+            for (ours, theirs) in [(&kept, &deleted), (&deleted, &kept)] {
+                for fmt in [MarkerFormat::default(), MarkerFormat::standard(11)] {
+                    let r = crate::merge::entity_merge_fmt(
+                        &base,
+                        ours,
+                        theirs,
+                        path,
+                        &fmt,
+                        &Host::default(),
+                    );
+                    assert!(!r.is_clean(), "{path}");
+                    for (side, expected) in [(Resolution::Ours, ours), (Resolution::Theirs, theirs)]
+                    {
+                        assert_eq!(
+                            &resolve_conflicts(&r.content, side),
+                            expected,
+                            "{path}\n{}",
+                            r.content
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_examples_with_repeated_names_keep_independent_edits() {
+        use crate::frame::{resolve_conflicts, Resolution};
+        let base =
+            "title\n\nfirst\n A;\n\n old\nend first\n\nsecond\n A,\n\n old\nend second\n\ntail\n";
+        let ours = base
+            .replace("first\n A;", "new first\n A;")
+            .replace(" A;\n\n old", " A\n")
+            .replace(" A,\n\n old", " A\n");
+        let theirs = base.replace(" old", " edited").replace("tail", "new tail");
+        let fmt = MarkerFormat::standard(11);
+        let result = crate::merge::entity_merge_fmt(
+            base,
+            &ours,
+            &theirs,
+            "examples.j2",
+            &fmt,
+            &Host::default(),
+        );
+        assert!(!result.is_clean());
+        assert_eq!(
+            resolve_conflicts(&result.content, Resolution::Ours),
+            ours.replace("tail", "new tail")
+        );
+        assert_eq!(
+            resolve_conflicts(&result.content, Resolution::Theirs),
+            theirs.replace("first\n A;", "new first\n A;")
+        );
+    }
+
+    #[test]
+    fn latex_row_separator_follows_the_retained_row() {
+        use crate::frame::{resolve_conflicts, Resolution};
+        for gap in ["", "\n", "% row comment\n"] {
+            let table = |row: &str| {
+                format!("\\section{{Test}}\n\\begin{{tabular}}{{ll}}\nOne & two{row}\n\\end{{tabular}}\n")
+            };
+            let base = table(&format!(" \\\\\n{gap}Three & four"));
+            let edited = base.replace("four", "five");
+            for removed in [table(""), table(r" \\")] {
+                for (ours, theirs) in [(&edited, &removed), (&removed, &edited)] {
+                    for fmt in [
+                        MarkerFormat {
+                            marker_length: 11,
+                            ..MarkerFormat::default()
+                        },
+                        MarkerFormat::standard(3),
+                    ] {
+                        let r = crate::merge::entity_merge_fmt(
+                            &base,
+                            ours,
+                            theirs,
+                            "paper.tex",
+                            &fmt.clone().for_file("paper.tex"),
+                            &Host::default(),
+                        );
+                        if fmt.enhanced {
+                            assert!(r.content.contains("% refused_by:"));
+                            assert_eq!(crate::parse_weave_conflicts(&r.content).len(), 1);
+                        }
+                        assert!(!r.is_clean());
+                        assert_eq!(&resolve_conflicts(&r.content, Resolution::Ours), ours);
+                        assert_eq!(&resolve_conflicts(&r.content, Resolution::Theirs), theirs);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_one_sided_crlf_conversion_is_reported_as_an_encoding_change() {
         assert!(encoding_differs("a\n", "a\r\n", "a\n"));
         assert!(!encoding_differs("a\n", "a\n", "a\n"));
@@ -509,7 +663,8 @@ pub(crate) fn merge_file(
 
     let separator = entity_separator(file_path);
     let line_merge = |required: Option<&EntityConflict>| {
-        let mut result = crate::merge::line_level_fallback(base, ours, theirs, file_path, host);
+        let mut result =
+            crate::merge::line_level_fallback(base, ours, theirs, marker_format.marker_length, host);
         if !result.is_clean() {
             result.content = crate::conflict::format_member_hunks(
                 &result.content,

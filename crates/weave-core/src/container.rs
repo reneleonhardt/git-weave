@@ -104,6 +104,23 @@ impl Decomposed {
     fn keys(&self) -> Vec<MemberKey> {
         self.members.iter().map(|m| m.key.clone()).collect()
     }
+
+    /// Removing a member can edit its predecessor too (the comma in an
+    /// object, or the semicolon before a Java enum's methods).
+    fn changed_before_missing(&self, other: &Self, index: &HashMap<&MemberKey, &Member>) -> bool {
+        let mut changed = self.prelude != other.prelude
+            || (self.prelude.is_empty()
+                && self.header.lines().next_back() != other.header.lines().next_back());
+        for m in &self.members {
+            match index.get(&m.key) {
+                Some(peer) => changed = m.text.lines().next_back() != peer.text.lines().next_back(),
+                None if changed => return true,
+                None => {}
+            }
+        }
+        false
+    }
+
     fn index(&self) -> HashMap<&MemberKey, &Member> {
         self.members.iter().map(|m| (&m.key, m)).collect()
     }
@@ -242,15 +259,17 @@ fn indentation_member_spans(
     if body_start >= body_end {
         return None;
     }
+    let depths = crate::statement::depths(lines)?;
     let member_indent = lines[body_start..body_end]
         .iter()
-        .find(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())?;
+        .zip(&depths[body_start..body_end])
+        .find(|(line, depth)| depth.is_some() && !line.trim().is_empty())
+        .map(|(line, _)| line.len() - line.trim_start().len())?;
 
     let mut spans: Vec<MemberSpan> = Vec::new();
     for (i, line) in lines.iter().enumerate().take(body_end).skip(body_start) {
         let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || depths[i].is_none() {
             continue;
         }
         let indent = line.len() - line.trim_start().len();
@@ -899,6 +918,24 @@ pub(crate) fn container_merge(
         host,
         path,
     ));
+    if has_conflict
+        && (o.changed_before_missing(&t, &ti)
+            || t.changed_before_missing(&o, &oi)
+            || (!marker_format.fmt.enhanced
+                && (o.changed_before_missing(&b, &bi)
+                    || t.changed_before_missing(&b, &bi)
+                    || b.changed_before_missing(&o, &oi)
+                    || b.changed_before_missing(&t, &ti))))
+    {
+        out = crate::merge::scoped_conflict_sides(
+            "members",
+            [Some(base), Some(ours), Some(theirs)],
+            false,
+            false,
+            marker_format,
+        );
+        evidence_local.clear();
+    }
     if !ours.ends_with('\n') {
         while out.ends_with('\n') {
             out.pop();
@@ -988,6 +1025,55 @@ mod tests {
 
     fn decomp(content: &str) -> Decomposed {
         decompose(content, &[], 1).expect("decomposes")
+    }
+
+    #[test]
+    fn member_conflicts_keep_the_boundary_in_each_resolution() {
+        use crate::conflict::MarkerFormat;
+        use crate::frame::{resolve_conflicts, Resolution};
+        use crate::merge::entity_merge_fmt;
+
+        for (path, header, last, deleted, original, edit, footer) in [
+            (
+                "E.java",
+                "enum E {",
+                "A;",
+                "A",
+                "int f() { return 1; }",
+                "int f() { return 2; }",
+                "}",
+            ),
+            ("e.rs", "enum E {", "A,", "A", "B(i32)", "B(i64)", "}"),
+            ("e.cpp", "enum E {", "A,", "A", "B = 1", "B = 2", "};"),
+            ("x.ts", "const x = {", "a: 1,", "a: 1", "b: 1", "b: 2", "};"),
+        ] {
+            for gap in ["", "\n", "  // shared comment\n"] {
+                let with = |member| format!("{header}\n  {last}\n{gap}  {member}\n{footer}\n");
+                let without = format!("{header}\n  {deleted}\n{gap}{footer}\n");
+                let (base, changed) = (with(original), with(edit));
+                for (ours, theirs) in [(&without, &changed), (&changed, &without)] {
+                    for fmt in [MarkerFormat::default(), MarkerFormat::standard(11)] {
+                        let result =
+                            entity_merge_fmt(&base, ours, theirs, path, &fmt, &Host::default());
+                        assert!(!result.is_clean(), "{path}: {}", result.content);
+                        for (side, want) in [(Resolution::Ours, ours), (Resolution::Theirs, theirs)]
+                        {
+                            assert_eq!(
+                                resolve_conflicts(&result.content, side),
+                                *want,
+                                "{path}: {}",
+                                result.content
+                            );
+                        }
+                        if !fmt.enhanced {
+                            assert!(result.content.contains(&format!(
+                                "||||||||||| base\n  {last}\n{gap}  {original}\n"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The property everything else rests on: the pieces are a partition.
