@@ -13,9 +13,10 @@ use weave_core::merge::STRUCTURE_LIMIT_BYTES;
 
 pub(crate) static REGISTRY: LazyLock<ParserRegistry> = LazyLock::new(create_default_registry);
 
-/// Check files that have a data reader or a grammar specific to their format.
+/// Check files with a data reader, a format-specific grammar, or embedded YAML.
 pub(crate) fn is_supported(path: &str) -> bool {
     weave_core::datafile::format_name(path).is_some()
+        || weave_core::markdown_yaml::supports(path)
         || REGISTRY.get_explicit_plugin(path).is_some()
 }
 
