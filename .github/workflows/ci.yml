@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-26]
+        os: [ubuntu-latest, windows-latest, macos-26] # macos-26 is Apple silicon
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -37,26 +37,7 @@ jobs:
         with:
           tool: nextest@0.9.152
       - name: Run workspace tests
-        shell: bash
-        run: |
-          sysctl hw.logicalcpu hw.memsize
-          args=(--profile ci --cargo-quiet --locked --workspace --tests --status-level none)
-          time cargo nextest run "${args[@]}" --no-run
-          for threads in num-cpus 6 num-cpus; do
-            echo "::group::Test threads: $threads"
-            time cargo nextest run "${args[@]}" --test-threads "$threads"
-            python3 - <<'REPORT'
-          import hashlib, heapq, xml.etree.ElementTree as ET
-          suites = ET.parse("target/nextest/ci/junit.xml").findall("testsuite")
-          cases = [(s.get("name"), c.get("name"), float(c.get("time", 0)))
-                   for s in suites for c in s.findall("testcase")]
-          names = '\n'.join(sorted(f"{suite}/{name}" for suite, name, _ in cases))
-          print(len(cases), "tests", hashlib.sha256(names.encode()).hexdigest())
-          for suite, name, seconds in heapq.nlargest(15, cases, key=lambda row: row[2]):
-              print(f"{seconds:5.2f}s {suite} {name}")
-          REPORT
-            echo "::endgroup::"
-          done
+        run: cargo nextest run --profile ci --cargo-quiet --locked --workspace --tests --status-level none
       - name: Verify both public merge suites ran
         shell: python
         run: |
@@ -90,3 +71,17 @@ jobs:
           -E 'package(=weave-core) & test(=dataunion::yaml_suite::upstream_yaml_fixtures)'
       - name: Run doctests
         run: cargo test --quiet --locked --workspace --doc
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check tracked Rust files are under crates/<package>/
+        shell: bash
+        run: git ls-files -- '*.rs' ':(exclude,glob)crates/*/**/*.rs' | diff /dev/null -
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --quiet --locked --workspace --all-targets -- -D warnings
