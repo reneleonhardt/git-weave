@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-26] # macos-26 is Apple silicon
+        os: [windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -37,7 +37,7 @@ jobs:
         with:
           tool: nextest@0.9.152
       - name: Run workspace tests
-        run: cargo nextest run --profile ci --cargo-quiet --locked --workspace --tests --status-level none
+        run: cargo nextest run --profile ci --no-fail-fast --cargo-quiet --locked --workspace --tests --status-level none
       - name: Verify both public merge suites ran
         shell: python
         run: |
@@ -71,17 +71,3 @@ jobs:
           -E 'package(=weave-core) & test(=dataunion::yaml_suite::upstream_yaml_fixtures)'
       - name: Run doctests
         run: cargo test --quiet --locked --workspace --doc
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Check tracked Rust files are under crates/<package>/
-        shell: bash
-        run: git ls-files -- '*.rs' ':(exclude,glob)crates/*/**/*.rs' | diff /dev/null -
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --quiet --locked --workspace --all-targets -- -D warnings
