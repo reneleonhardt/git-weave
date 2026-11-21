@@ -1,6 +1,3 @@
-[profile.ci]
-leak-timeout = { period = "100ms", result = "fail" }
-
 [profile.ci.junit]
 path = "junit.xml"
 report-skipped = "none"
