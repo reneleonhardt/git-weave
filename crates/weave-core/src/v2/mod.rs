@@ -286,27 +286,45 @@ mod tests {
 
     #[test]
     fn deleting_the_last_member_and_its_comma_is_one_choice() {
-        for gap in ["\n", "  // shared comment\n"] {
+        for gap in [
+            "\n",
+            "  // shared comment\n",
+            "  /* shared comment\n     with a continuation */\n",
+        ] {
             let doc = |first, tail| format!("{{\n  \"a\": {first}\n{gap}{tail}}}\n");
             let base = doc("1,", "  \"b\": 1\n");
             let keep = doc("3,", "  \"b\": 3\n");
             for first in ["2", "{}"] {
                 let delete = doc(first, "");
                 for (ours, theirs) in [(&delete, &keep), (&keep, &delete)] {
-                    let result = crate::merge::entity_merge(&base, ours, theirs, "x.json");
-                    assert_eq!(
-                        result
-                            .content
-                            .lines()
-                            .filter(|l| l.starts_with("<<<<<<<"))
-                            .count(),
-                        1,
-                        "{}",
-                        result.content
-                    );
-                    for (side, expected) in [(Resolution::Ours, ours), (Resolution::Theirs, theirs)]
-                    {
-                        assert_eq!(resolve_conflicts(&result.content, side), *expected);
+                    for (path, fmt) in [
+                        ("x.json", MarkerFormat::default()),
+                        ("x.jsonc", MarkerFormat::standard(11)),
+                    ] {
+                        let open = "<".repeat(fmt.marker_length);
+                        let result = crate::merge::entity_merge_fmt(
+                            &base,
+                            ours,
+                            theirs,
+                            path,
+                            &fmt,
+                            &Host::default(),
+                        );
+                        assert_eq!(
+                            result
+                                .content
+                                .lines()
+                                .filter(|l| l.starts_with(&open))
+                                .count(),
+                            1,
+                            "{}",
+                            result.content
+                        );
+                        for (side, expected) in
+                            [(Resolution::Ours, ours), (Resolution::Theirs, theirs)]
+                        {
+                            assert_eq!(resolve_conflicts(&result.content, side), *expected);
+                        }
                     }
                 }
             }
@@ -663,22 +681,14 @@ pub(crate) fn merge_file(
 
     let separator = entity_separator(file_path);
     let line_merge = |required: Option<&EntityConflict>| {
-        let mut result = crate::merge::line_level_fallback(
-            base,
-            ours,
-            theirs,
-            marker_format.marker_length,
+        let mut result = crate::merge::line_level_fallback_fmt(
+            [base, ours, theirs],
+            file_path,
+            marker_format,
             host,
+            required.is_some(),
         );
-        if !result.is_clean() {
-            result.content = crate::conflict::format_member_hunks(
-                &result.content,
-                marker_format,
-                [base, ours, theirs],
-                file_path,
-                required.is_some(),
-            );
-        } else if let Some(conflict) = required {
+        if let (true, Some(conflict)) = (result.is_clean(), required) {
             // The predecessor and the optional member require one decision,
             // even when a shared blank or comment line separates them.
             result.content = crate::merge::scoped_conflict_sides(

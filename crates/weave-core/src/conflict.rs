@@ -1217,8 +1217,7 @@ pub(crate) fn format_member_hunks(
         || pieces.windows(3).any(|window| {
             matches!(window, [Piece::Box(_), Piece::Frame(gap), Piece::Box(next)]
                 if (next.ours.is_empty() || next.theirs.is_empty())
-                    && gap.iter().all(|line| line.trim().is_empty()
-                        || crate::binding::is_trivia_line(line)))
+                    && crate::datafile::json_trivia(&gap.join("\n")))
         });
     // A line merge can split a separator from its member at an unchanged
     // blank or comment line. Validate the documents each choice would keep.

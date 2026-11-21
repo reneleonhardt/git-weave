@@ -173,6 +173,17 @@ pub(crate) fn json_keys(text: &str) -> Result<KeyTally, String> {
     Ok(tally)
 }
 
+pub(crate) fn json_trivia(text: &str) -> bool {
+    let mut walk = Json {
+        s: text.as_bytes(),
+        i: 0,
+        tally: &mut KeyTally::new(),
+        relaxed: true,
+    };
+    walk.skip();
+    walk.peek().is_none()
+}
+
 fn json_lines_keys(text: &str) -> Result<KeyTally, String> {
     let mut tally = KeyTally::new();
     for (i, line) in text.lines().enumerate() {
