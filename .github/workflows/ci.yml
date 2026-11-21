@@ -37,6 +37,9 @@ jobs:
         with:
           tool: nextest@0.9.152
       - name: Run workspace tests
+        env:
+          # Overlap Git-heavy tests on the three-core macOS runner.
+          NEXTEST_TEST_THREADS: ${{ runner.os == 'macOS' && '6' || 'num-cpus' }}
         run: cargo nextest run --profile ci --cargo-quiet --locked --workspace --tests --status-level none
       - name: Verify both public merge suites ran
         shell: python
@@ -70,7 +73,12 @@ jobs:
           --run-ignored only --no-tests fail
           -E 'package(=weave-core) & test(=dataunion::yaml_suite::upstream_yaml_fixtures)'
       - name: Run doctests
-        run: cargo test --quiet --locked --workspace --doc
+        shell: bash
+        run: |
+          cargo test --quiet --locked --workspace --doc | sed \
+            -e '/^[[:space:]]*$/d' \
+            -e '/^running 0 tests[[:space:]]*$/d' \
+            -e '/^test result: ok\. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;/d'
 
   lint:
     runs-on: ubuntu-latest
