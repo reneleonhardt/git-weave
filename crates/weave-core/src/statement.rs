@@ -1135,9 +1135,7 @@ fn statement_merge_inner(
         return Some(InnerMergeResult {
             content: crate::merge::scoped_conflict_sides(
                 "statements",
-                Some(base),
-                Some(ours),
-                Some(theirs),
+                [Some(base), Some(ours), Some(theirs)],
                 false,
                 false,
                 fmt,
