@@ -1,3 +1,9 @@
 [profile.ci.junit]
 path = "junit.xml"
 report-skipped = "none"
+
+[[profile.ci.overrides]]
+# Run the matching time check on its own on macOS.
+platform = 'cfg(target_os = "macos")'
+filter = 'test(=v2::match_phase::tests::a_flood_of_identical_bodies_pairs_deterministically_without_a_cap)'
+threads-required = "num-test-threads"
