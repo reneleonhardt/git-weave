@@ -1564,6 +1564,7 @@ mod tests {
         for work in [
             "name: |\n  ---\n---suffix: value\nname: duplicate\n---\nname: separate\n",
             "--- {id: 1}\n---\nnested: [{id: 2, 'id': 3}]\n",
+            "? {a: 1, b: 2}\n: first\n? {b: 2, a: 1}\n: second\n",
             r#"data: {"app": one, "\u0061pp": two}"#,
         ] {
             let findings = verify_file("lock.yaml", Some(work), Some(work), Some(work), work);

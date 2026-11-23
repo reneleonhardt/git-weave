@@ -94,12 +94,15 @@ fn yaml_keys(text: &str) -> Result<KeyTally, String> {
         };
         for item in items {
             // Other fields (e.g. Kubernetes `kind`) can be shared by distinct items.
-            let Some(id @ (Value::String(_) | Value::Number(_) | Value::Bool(_))) =
-                item.untag_ref().get("id")
-            else {
+            let Some(id) = item.untag_ref().get("id").filter(|id| {
+                matches!(
+                    id.untag_ref(),
+                    Value::String(_) | Value::Number(_) | Value::Bool(_)
+                )
+            }) else {
                 continue;
             };
-            let label = oneyaml::to_string(id).map_err(|e| e.to_string())?;
+            let label = id.to_yaml_string().map_err(|e| e.to_string())?;
             *local.entry(label).or_insert(0) += 1;
         }
         for (id, count) in local.drain() {

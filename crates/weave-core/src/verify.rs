@@ -1603,6 +1603,16 @@ mod tests {
     }
 
     #[test]
+    fn yaml_sequence_ids_preserve_scalar_tags() {
+        let item = "- id: !Ref job\n";
+        let distinct = format!("{item}- id: !Other job\n- id: job\n");
+        let verify = |merged: &str| structured_data(Some(item), Some(item), merged, "jobs.yaml");
+        assert!(verify(&distinct).is_none());
+        assert!(verify(&format!("{item}---\n{item}")).is_none());
+        assert!(verify(&item.repeat(2)).is_some());
+    }
+
+    #[test]
     fn a_composition_cannot_invent_a_data_key() {
         for (path, side, merged) in [
             ("p.yaml", "a: 1\n", "b: 2\n"),
@@ -1626,6 +1636,7 @@ mod tests {
             ("'1': x", "1: x", Some("bindings")),
             ("!old name: x", "!new name: x", Some("bindings")),
             ("? [a, b]\n: x", "? [a, c]\n: x", Some("bindings")),
+            ("? {a: b}\n: x", "'{a: b}': x", Some("bindings")),
             ("? {a: 1, b: 2}\n: x", "? {b: 2, a: 1}\n: x", None),
             ("0x1: x", "1: x", None),
         ] {
