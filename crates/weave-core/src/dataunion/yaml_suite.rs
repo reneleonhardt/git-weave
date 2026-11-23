@@ -1,6 +1,46 @@
-use super::{load, Format};
+use super::{certify, load, undeclared, Format};
+use serde::Deserialize;
 use serde_json::Value;
 use std::{env, fs, path::Path, process::Command};
+
+#[derive(Deserialize)]
+struct RequiredCase {
+    name: String,
+    input: String,
+    #[serde(default)]
+    reject: bool,
+    json: Option<Vec<Value>>,
+    equivalent: Option<String>,
+    changed: Option<String>,
+}
+
+#[test]
+fn required_yaml_behavior() {
+    let cases: Vec<RequiredCase> =
+        serde_json::from_str(include_str!("../../tests/fixtures/yaml/required.json")).unwrap();
+    assert!(!cases.is_empty());
+    for case in cases {
+        let input = &case.input;
+        let keys = crate::datafile::keys("input.yaml", input).unwrap();
+        assert_eq!(keys.is_err(), case.reject, "{}: {keys:?}", case.name);
+        assert_eq!(load(input, Format::Yaml), case.json, "{}", case.name);
+        if let Some(equivalent) = case.equivalent {
+            let docs = |text| {
+                crate::datafile::yaml_documents(text)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            assert_eq!(docs(input), docs(&equivalent), "{}", case.name);
+        }
+        if let Some(changed) = case.changed {
+            assert!(
+                !certify(input, input, input, &changed, "input.yaml", &undeclared),
+                "{}: certified a changed value",
+                case.name
+            );
+        }
+    }
+}
 
 #[test]
 #[ignore = "requires the yaml-test-suite data checkout used in CI"]

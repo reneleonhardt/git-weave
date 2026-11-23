@@ -255,9 +255,30 @@ fn load(text: &str, f: Format) -> Option<Vec<Value>> {
             serde_json::to_value(t).ok().map(|v| vec![v])
         }
         Format::Yaml => crate::datafile::yaml_documents(text)
-            .map(|doc| Value::try_from(doc.ok()?).ok())
+            .map(|doc| yaml_json(&doc.ok()?))
             .collect(),
     }
+}
+
+fn yaml_json(doc: &oneyaml::Value) -> Option<Value> {
+    use oneyaml::{Number, Value as Yaml};
+
+    let mut pending = vec![doc];
+    while let Some(value) = pending.pop() {
+        match value {
+            // OneYAML retains underflows in its value tree but projects them to zero.
+            Yaml::Number(n)
+                if n.as_float()
+                    .is_some_and(|f| f == 0.0 && n != &Number::from(f)) =>
+            {
+                return None;
+            }
+            Yaml::Sequence(items) => pending.extend(items),
+            Yaml::Mapping(mapping) => pending.extend(mapping.values()),
+            _ => {}
+        }
+    }
+    Value::try_from(doc).ok()
 }
 
 /// Whether the array at a key path was declared a set by the file's owner
@@ -638,16 +659,17 @@ mod tests {
 
     #[test]
     fn yaml_quotes_and_boolean_spellings_follow_each_documents_version() {
-        let values = "[true, FALSE, y, N, Yes, NO, ON, off, 'true', 'it''s', 'a\\nb']";
+        let values = "[true, FALSE, y, N, Yes, NO, ON, off, 'true', 'it''s', 'a\\nb', ! 12]";
         let stream = format!("%YAML 1.1\n--- {values}\n...\n--- {values}\n");
         assert_eq!(
             load(&stream, Format::Yaml).unwrap(),
             [
                 serde_json::json!([
-                    true, false, true, false, true, false, true, false, "true", "it's", "a\\nb"
+                    true, false, true, false, true, false, true, false, "true", "it's", "a\\nb",
+                    "12"
                 ]),
                 serde_json::json!([
-                    true, false, "y", "N", "Yes", "NO", "ON", "off", "true", "it's", "a\\nb"
+                    true, false, "y", "N", "Yes", "NO", "ON", "off", "true", "it's", "a\\nb", "12"
                 ]),
             ]
         );
@@ -665,6 +687,14 @@ mod tests {
                 "{original}"
             );
         }
+    }
+
+    #[test]
+    fn yaml_certification_distinguishes_integers_from_floats() {
+        let stream = "--- 012\n--- [0.0, -0.0]\n";
+        let verify = |merged| certify(stream, stream, stream, merged, "a.yml", &undeclared);
+        assert!(verify("--- 12\n--- [0.0, -0.0]\n"));
+        assert!(!verify("--- 12.0\n--- [0.0, -0.0]\n"));
     }
 
     #[test]
